@@ -13,9 +13,12 @@ Variables de entorno necesarias (se configuran en Render, no acá):
 """
 
 import os
+import io
+import re
 import time
 import logging
 import requests
+import pdfplumber
 from flask import Flask, request, jsonify
 
 logging.basicConfig(level=logging.INFO)
@@ -44,11 +47,83 @@ CHANNELS = _parse_channels()
 RECENT_POSTS = {name: [] for name in CHANNELS}
 MAX_POSTS_PER_CHANNEL = 30
 
+# Documentos (PDFs) que el bot fue aprendiendo. En RAM: se pierde si el server reinicia.
+DOCUMENTS = {}  # clave corta -> {"title": ..., "text": ...}
+MAX_DOC_CHARS = 700_000  # límite de texto por documento para no pasarnos del contexto de Gemini
+
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 GEMINI_API = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     f"gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
 )
+
+# --- Manejo de documentos PDF (biblioteca de estudio) ---
+
+def slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:40] or "documento"
+
+
+def download_telegram_file(file_id: str) -> bytes:
+    info = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=15).json()
+    file_path = info["result"]["file_path"]
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+    return requests.get(file_url, timeout=60).content
+
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    text_parts = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            text_parts.append(page_text)
+    return "\n".join(text_parts)[:MAX_DOC_CHARS]
+
+
+def handle_incoming_document(document: dict) -> str:
+    file_name = document.get("file_name", "documento.pdf")
+    if not file_name.lower().endswith(".pdf"):
+        return f"'{file_name}' no es un PDF — por ahora solo puedo leer PDFs."
+
+    try:
+        pdf_bytes = download_telegram_file(document["file_id"])
+        text = extract_pdf_text(pdf_bytes)
+    except Exception:
+        log.exception("Error procesando PDF")
+        return "No pude procesar ese PDF."
+
+    if not text.strip():
+        return f"Descargué '{file_name}' pero no pude extraerle texto (puede ser un PDF escaneado como imagen)."
+
+    key = slugify(file_name.rsplit(".", 1)[0])
+    DOCUMENTS[key] = {"title": file_name, "text": text}
+    return (
+        f"Aprendí '{file_name}' ({len(text):,} caracteres).\n"
+        f"Preguntame con: /libro {key} tu pregunta\n"
+        f"Ver todos: /libros"
+    )
+
+
+def ask_about_document(key: str, question: str) -> str:
+    doc = DOCUMENTS.get(key)
+    if not doc:
+        return f"No tengo ningún documento guardado como '{key}'. Usá /libros para ver la lista."
+
+    prompt = (
+        f"Basándote únicamente en el siguiente documento titulado '{doc['title']}', "
+        f"respondé en español la pregunta del usuario. Si la respuesta no está en el "
+        f"documento, decilo claramente.\n\n"
+        f"DOCUMENTO:\n{doc['text']}\n\n"
+        f"PREGUNTA: {question}"
+    )
+    try:
+        data = call_gemini([{"role": "user", "parts": [{"text": prompt}]}])
+        parts = data["candidates"][0]["content"].get("parts", [])
+        return "".join(p.get("text", "") for p in parts).strip() or "No pude generar una respuesta."
+    except Exception:
+        log.exception("Error consultando documento")
+        return "Tuve un problema para responder sobre ese documento. Probá de nuevo."
+
 
 # Memoria simple en RAM: guarda los últimos mensajes por chat.
 # Se pierde si el servidor gratis de Render "duerme" y se reinicia.
@@ -288,6 +363,19 @@ def handle_owner_command(chat_id: int, text: str) -> bool:
             send_telegram_message(chat_id, summarize_channel(name))
         return True
 
+    if cmd == "/libros":
+        if not DOCUMENTS:
+            send_telegram_message(chat_id, "Todavía no aprendí ningún PDF. Reenviame uno.")
+        else:
+            lista = "\n".join(f"• {k} — {d['title']}" for k, d in DOCUMENTS.items())
+            send_telegram_message(chat_id, f"Documentos guardados:\n{lista}")
+        return True
+
+    if cmd == "/libro" and len(parts) == 3:
+        key, question = parts[1].lower(), parts[2]
+        send_telegram_message(chat_id, ask_about_document(key, question))
+        return True
+
     return False
 
 
@@ -313,6 +401,11 @@ def webhook():
     sender_id = str(message.get("from", {}).get("id", ""))
     text = message.get("text", "")
 
+    if message.get("document") and OWNER_ID and sender_id == OWNER_ID:
+        send_telegram_message(chat_id, "Procesando el PDF, dame un momento...")
+        send_telegram_message(chat_id, handle_incoming_document(message["document"]))
+        return jsonify(ok=True)
+
     if not text:
         send_telegram_message(chat_id, "Por ahora solo entiendo texto.")
         return jsonify(ok=True)
@@ -335,4 +428,3 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-    
