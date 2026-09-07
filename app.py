@@ -16,9 +16,11 @@ import os
 import io
 import re
 import time
+import gc
+import threading
 import logging
 import requests
-import pdfplumber
+from pypdf import PdfReader
 from flask import Flask, request, jsonify
 
 logging.basicConfig(level=logging.INFO)
@@ -49,7 +51,7 @@ MAX_POSTS_PER_CHANNEL = 30
 
 # Documentos (PDFs) que el bot fue aprendiendo. En RAM: se pierde si el server reinicia.
 DOCUMENTS = {}  # clave corta -> {"title": ..., "text": ...}
-MAX_DOC_CHARS = 700_000  # límite de texto por documento para no pasarnos del contexto de Gemini
+MAX_DOC_CHARS = 300_000  # límite de texto por documento (memoria limitada en el plan Free de Render)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 GEMINI_API = (
@@ -73,11 +75,22 @@ def download_telegram_file(file_id: str) -> bytes:
 
 def extract_pdf_text(pdf_bytes: bytes) -> str:
     text_parts = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text() or ""
-            text_parts.append(page_text)
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    for page in reader.pages:
+        try:
+            text_parts.append(page.extract_text() or "")
+        except Exception:
+            continue
+        if sum(len(t) for t in text_parts) > MAX_DOC_CHARS:
+            break
+    del reader
+    gc.collect()
     return "\n".join(text_parts)[:MAX_DOC_CHARS]
+
+
+def process_document_async(document: dict, notify_chat_id):
+    resultado = handle_incoming_document(document)
+    send_telegram_message(notify_chat_id, resultado)
 
 
 def handle_incoming_document(document: dict) -> str:
@@ -319,9 +332,13 @@ def handle_channel_post(post: dict):
         return
 
     if post.get("document"):
-        resultado = handle_incoming_document(post["document"])
         if OWNER_ID:
-            send_telegram_message(OWNER_ID, f"[{name}] {resultado}")
+            threading.Thread(
+                target=lambda: send_telegram_message(
+                    OWNER_ID, f"[{name}] " + handle_incoming_document(post["document"])
+                ),
+                daemon=True,
+            ).start()
         return
 
     text = post.get("text") or post.get("caption") or ""
@@ -409,8 +426,12 @@ def webhook():
     text = message.get("text", "")
 
     if message.get("document") and OWNER_ID and sender_id == OWNER_ID:
-        send_telegram_message(chat_id, "Procesando el PDF, dame un momento...")
-        send_telegram_message(chat_id, handle_incoming_document(message["document"]))
+        send_telegram_message(chat_id, "Recibí el PDF, lo estoy procesando (puede tardar un minuto)...")
+        threading.Thread(
+            target=process_document_async,
+            args=(message["document"], chat_id),
+            daemon=True,
+        ).start()
         return jsonify(ok=True)
 
     if not text:
@@ -435,3 +456,4 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+    
