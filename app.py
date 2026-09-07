@@ -13,6 +13,7 @@ Variables de entorno necesarias (se configuran en Render, no acá):
 """
 
 import os
+import time
 import logging
 import requests
 from flask import Flask, request, jsonify
@@ -57,10 +58,22 @@ def ask_gemini(chat_id: int, user_text: str) -> str:
     }
 
     try:
-        r = requests.post(GEMINI_API, json=payload, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        reply = data["candidates"][0]["content"]["parts"][0]["text"]
+        last_error = None
+        for attempt in range(3):
+            try:
+                r = requests.post(GEMINI_API, json=payload, timeout=30)
+                r.raise_for_status()
+                data = r.json()
+                reply = data["candidates"][0]["content"]["parts"][0]["text"]
+                break
+            except requests.exceptions.HTTPError as e:
+                last_error = e
+                if r.status_code in (503, 429) and attempt < 2:
+                    time.sleep(2 * (attempt + 1))  # espera 2s, luego 4s
+                    continue
+                raise
+        else:
+            raise last_error
     except Exception as e:
         log.exception("Error llamando a Gemini")
         reply = "Tuve un problema para pensar la respuesta. Probá de nuevo en un momento."
