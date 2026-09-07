@@ -17,6 +17,7 @@ import io
 import re
 import time
 import gc
+import unicodedata
 import threading
 import logging
 import requests
@@ -62,6 +63,7 @@ GEMINI_API = (
 # --- Manejo de documentos PDF (biblioteca de estudio) ---
 
 def slugify(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return slug[:40] or "documento"
 
