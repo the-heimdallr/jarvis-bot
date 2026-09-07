@@ -26,6 +26,23 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "changeme")
+OWNER_ID = os.environ.get("OWNER_ID")  # tu ID de Telegram (numérico), para que solo vos administres los canales
+
+# CHANNELS: "nombre1:id1,nombre2:id2" -> ej "ciberdefensa:-1001234567890,cienciaspoliticas:-1009876543210"
+def _parse_channels():
+    raw = os.environ.get("CHANNELS", "")
+    channels = {}
+    for pair in raw.split(","):
+        if ":" in pair:
+            name, cid = pair.split(":", 1)
+            channels[name.strip().lower()] = cid.strip()
+    return channels
+
+CHANNELS = _parse_channels()
+
+# Guarda los últimos posts de cada canal en RAM (se pierde si el server reinicia)
+RECENT_POSTS = {name: [] for name in CHANNELS}
+MAX_POSTS_PER_CHANNEL = 30
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 GEMINI_API = (
@@ -171,12 +188,97 @@ def ask_gemini(chat_id: int, user_text: str) -> str:
     return reply
 
 
-def send_telegram_message(chat_id: int, text: str):
+def send_telegram_message(chat_id, text: str):
     requests.post(
         f"{TELEGRAM_API}/sendMessage",
         json={"chat_id": chat_id, "text": text},
         timeout=15,
     )
+
+
+def pin_last_message(channel_name: str) -> str:
+    posts = RECENT_POSTS.get(channel_name, [])
+    if not posts:
+        return f"No tengo mensajes registrados todavía de '{channel_name}'."
+    last = posts[-1]
+    r = requests.post(
+        f"{TELEGRAM_API}/pinChatMessage",
+        json={"chat_id": CHANNELS[channel_name], "message_id": last["message_id"]},
+        timeout=15,
+    )
+    return "Mensaje fijado." if r.ok else f"No pude fijarlo: {r.text}"
+
+
+def summarize_channel(channel_name: str) -> str:
+    posts = RECENT_POSTS.get(channel_name, [])
+    if not posts:
+        return f"Todavía no vi mensajes nuevos en '{channel_name}' desde que arrancó el bot."
+    texto = "\n---\n".join(p["text"] for p in posts[-15:] if p.get("text"))
+    prompt = (
+        f"Resumí en español, en viñetas claras, los temas tratados en estos "
+        f"últimos posts del canal '{channel_name}':\n\n{texto}"
+    )
+    try:
+        data = call_gemini([{"role": "user", "parts": [{"text": prompt}]}])
+        parts = data["candidates"][0]["content"].get("parts", [])
+        return "".join(p.get("text", "") for p in parts).strip() or "No pude armar el resumen."
+    except Exception:
+        log.exception("Error resumiendo canal")
+        return "Tuve un problema armando el resumen. Probá de nuevo."
+
+
+def handle_channel_post(post: dict):
+    chat_id_str = str(post["chat"]["id"])
+    name = next((n for n, cid in CHANNELS.items() if cid == chat_id_str), None)
+    if not name:
+        return  # canal no configurado, lo ignoramos
+    text = post.get("text") or post.get("caption") or ""
+    RECENT_POSTS.setdefault(name, []).append({
+        "message_id": post["message_id"],
+        "text": text,
+    })
+    RECENT_POSTS[name] = RECENT_POSTS[name][-MAX_POSTS_PER_CHANNEL:]
+
+
+def handle_owner_command(chat_id: int, text: str) -> bool:
+    """Devuelve True si el texto era un comando de administración y ya fue atendido."""
+    parts = text.strip().split(maxsplit=2)
+    cmd = parts[0].lower()
+
+    if cmd == "/canales":
+        if not CHANNELS:
+            send_telegram_message(chat_id, "No tenés canales configurados en CHANNELS todavía.")
+        else:
+            lista = "\n".join(f"• {n}" for n in CHANNELS)
+            send_telegram_message(chat_id, f"Canales configurados:\n{lista}")
+        return True
+
+    if cmd == "/post" and len(parts) == 3:
+        name, msg = parts[1].lower(), parts[2]
+        if name not in CHANNELS:
+            send_telegram_message(chat_id, f"No conozco el canal '{name}'. Usá /canales para ver la lista.")
+        else:
+            send_telegram_message(CHANNELS[name], msg)
+            send_telegram_message(chat_id, f"Publicado en {name}.")
+        return True
+
+    if cmd == "/pin" and len(parts) == 2:
+        name = parts[1].lower()
+        if name not in CHANNELS:
+            send_telegram_message(chat_id, f"No conozco el canal '{name}'.")
+        else:
+            send_telegram_message(chat_id, pin_last_message(name))
+        return True
+
+    if cmd == "/resumen" and len(parts) == 2:
+        name = parts[1].lower()
+        if name not in CHANNELS:
+            send_telegram_message(chat_id, f"No conozco el canal '{name}'.")
+        else:
+            send_telegram_message(chat_id, summarize_channel(name))
+        return True
+
+    return False
 
 
 @app.route("/", methods=["GET"])
@@ -188,12 +290,17 @@ def health():
 @app.route(f"/webhook/{WEBHOOK_SECRET if WEBHOOK_SECRET else 'hook'}", methods=["POST"])
 def webhook():
     update = request.get_json(force=True, silent=True) or {}
-    message = update.get("message") or update.get("edited_message")
 
+    if update.get("channel_post"):
+        handle_channel_post(update["channel_post"])
+        return jsonify(ok=True)
+
+    message = update.get("message") or update.get("edited_message")
     if not message:
         return jsonify(ok=True)
 
     chat_id = message["chat"]["id"]
+    sender_id = str(message.get("from", {}).get("id", ""))
     text = message.get("text", "")
 
     if not text:
@@ -205,6 +312,11 @@ def webhook():
         send_telegram_message(chat_id, "¡Hola! Soy tu Jarvis. ¿En qué te ayudo?")
         return jsonify(ok=True)
 
+    # Comandos de administración de canales: solo el dueño puede usarlos
+    if text.startswith("/") and OWNER_ID and sender_id == OWNER_ID:
+        if handle_owner_command(chat_id, text):
+            return jsonify(ok=True)
+
     reply = ask_gemini(chat_id, text)
     send_telegram_message(chat_id, reply)
     return jsonify(ok=True)
@@ -213,4 +325,3 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-    
