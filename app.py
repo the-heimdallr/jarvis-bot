@@ -231,7 +231,17 @@ def handle_channel_post(post: dict):
     chat_id_str = str(post["chat"]["id"])
     name = next((n for n, cid in CHANNELS.items() if cid == chat_id_str), None)
     if not name:
-        return  # canal no configurado, lo ignoramos
+        # Canal no configurado todavía: le avisamos al dueño su ID para que lo agregue.
+        if OWNER_ID:
+            titulo = post["chat"].get("title", "sin título")
+            send_telegram_message(
+                OWNER_ID,
+                f"Vi un post en un canal no configurado.\n"
+                f"Título: {titulo}\nID: {chat_id_str}\n\n"
+                f"Agregalo a la variable CHANNELS en Render, ej:\n"
+                f"nombre_que_quieras:{chat_id_str}",
+            )
+        return
     text = post.get("text") or post.get("caption") or ""
     RECENT_POSTS.setdefault(name, []).append({
         "message_id": post["message_id"],
@@ -325,3 +335,4 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+    
