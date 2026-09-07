@@ -29,7 +29,7 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "changeme")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 GEMINI_API = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    f"gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
 )
 
 # Memoria simple en RAM: guarda los últimos mensajes por chat.
