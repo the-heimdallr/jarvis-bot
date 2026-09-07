@@ -317,6 +317,13 @@ def handle_channel_post(post: dict):
                 f"nombre_que_quieras:{chat_id_str}",
             )
         return
+
+    if post.get("document"):
+        resultado = handle_incoming_document(post["document"])
+        if OWNER_ID:
+            send_telegram_message(OWNER_ID, f"[{name}] {resultado}")
+        return
+
     text = post.get("text") or post.get("caption") or ""
     RECENT_POSTS.setdefault(name, []).append({
         "message_id": post["message_id"],
@@ -428,3 +435,4 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+    
