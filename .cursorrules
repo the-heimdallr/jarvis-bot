@@ -1,10 +1,15 @@
-# Reglas para Asistentes de IA en este proyecto
+# Reglas para asistentes de IA en este proyecto
 
 1. Antes de realizar o proponer cambios, lee `.ia/CONTEXT.md` y `.ia/CHANGELOG_IA.md`.
-2. Mantén la compatibilidad con el entorno de despliegue de Render Free (control de uso de RAM y tiempos de respuesta).
-3. No elimines la lógica de seguridad (`WEBHOOK_SECRET` u `OWNER_ID`).
-4. Si agregas dependencias en Python, inclúyelas en `requirements.txt`.
-5. Al finalizar cada modificación:
-   - Actualiza el archivo `.ia/CHANGELOG_IA.md` detallando los cambios.
-   - Si creaste nuevas tareas, actualiza `.ia/ROADMAP.md`
+2. Mantén la compatibilidad con el entorno de despliegue de Render Free, incluyendo el uso de RAM y los tiempos de respuesta.
+3. No elimines la lógica de seguridad basada en `WEBHOOK_SECRET` y `OWNER_ID`.
+4. Si agregas dependencias de Python, inclúyelas en `requirements.txt`.
+5. No hardcodees tokens, claves API, secretos ni identificadores de Telegram.
+6. Valida los datos externos antes de usarlos y utiliza timeouts en todas las llamadas HTTP.
+7. Mantén las respuestas del bot en español, con el tono directo e informal existente.
+8. Conserva el healthcheck `GET /` y la compatibilidad con `gunicorn app:app`, salvo que el cambio lo requiera expresamente.
+9. Prefiere cambios pequeños y localizados; no introduzcas frameworks o persistencia sin documentar la decisión.
+10. Añade o actualiza pruebas para cambios de comportamiento y ejecuta al menos una validación de sintaxis antes de finalizar.
+11. Al finalizar cada modificación, actualiza `.ia/CHANGELOG_IA.md`; si creaste tareas, actualiza `.ia/ROADMAP.md`.
+12. No guardes información sensible ni credenciales en `.ia/`.
 .
