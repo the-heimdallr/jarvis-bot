@@ -1,1 +1,10 @@
+# Reglas para Asistentes de IA en este proyecto
 
+1. Antes de realizar o proponer cambios, lee `.ia/CONTEXT.md` y `.ia/CHANGELOG_IA.md`.
+2. Mantén la compatibilidad con el entorno de despliegue de Render Free (control de uso de RAM y tiempos de respuesta).
+3. No elimines la lógica de seguridad (`WEBHOOK_SECRET` u `OWNER_ID`).
+4. Si agregas dependencias en Python, inclúyelas en `requirements.txt`.
+5. Al finalizar cada modificación:
+   - Actualiza el archivo `.ia/CHANGELOG_IA.md` detallando los cambios.
+   - Si creaste nuevas tareas, actualiza `.ia/ROADMAP.md`
+.
