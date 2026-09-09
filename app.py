@@ -24,7 +24,10 @@ import unicodedata
 import threading
 import logging
 import secrets
+from datetime import datetime
 from contextlib import contextmanager
+from html import escape
+from zoneinfo import ZoneInfo
 import requests
 try:
     import pymupdf as fitz
@@ -79,6 +82,8 @@ def _parse_channel_themes():
 
 CHANNEL_THEMES = _parse_channel_themes()
 BOOK_CHANNEL = os.environ.get("BOOK_CHANNEL", "").strip().lower()
+DIARY_FILE = os.environ.get("DIARY_FILE", "diario.docx")
+ARGENTINA_TIMEZONE = ZoneInfo("America/Argentina/Buenos_Aires")
 
 MAX_POSTS_PER_CHANNEL = 30
 
@@ -140,6 +145,35 @@ CREATE TABLE IF NOT EXISTS channel_posts (
 );
 CREATE INDEX IF NOT EXISTS channel_posts_recent_idx
     ON channel_posts (channel_name, created_at DESC);
+CREATE TABLE IF NOT EXISTS diary_entries (
+    id SERIAL PRIMARY KEY,
+    entry TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS gastos (
+    id SERIAL PRIMARY KEY,
+    monto NUMERIC,
+    categoria TEXT,
+    descripcion TEXT,
+    fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS presupuestos (
+    id SERIAL PRIMARY KEY,
+    categoria TEXT,
+    monto_limite NUMERIC
+);
+CREATE TABLE IF NOT EXISTS inventario (
+    id SERIAL PRIMARY KEY,
+    item TEXT,
+    cantidad INT,
+    categoria TEXT
+);
+CREATE TABLE IF NOT EXISTS contactos (
+    id SERIAL PRIMARY KEY,
+    nombre TEXT,
+    telefono TEXT,
+    notas TEXT
+);
 """
 
 
@@ -391,6 +425,126 @@ def get_recent_channel_posts(channel_name):
             )
             rows = cursor.fetchall()
     return [{"message_id": row[0], "text": row[1]} for row in reversed(rows)]
+
+
+def save_diary_entry(text):
+    timestamp = datetime.now(ARGENTINA_TIMEZONE).replace(tzinfo=None)
+    line = f"[{timestamp:%d/%m/%Y %H:%M:%S}] {text}"
+    document = WordDocument(DIARY_FILE) if os.path.exists(DIARY_FILE) else WordDocument()
+    document.add_paragraph(line)
+    document.save(DIARY_FILE)
+    if DATABASE_URL:
+        with db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("INSERT INTO diary_entries (entry, created_at) VALUES (%s, %s)", (text, timestamp))
+    return line
+
+
+def build_diary_document():
+    if os.path.exists(DIARY_FILE):
+        with open(DIARY_FILE, "rb") as diary:
+            return diary.read()
+    document = WordDocument()
+    if DATABASE_URL:
+        with db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT entry, created_at FROM diary_entries ORDER BY created_at ASC, id ASC")
+                for entry, created_at in cursor.fetchall():
+                    document.add_paragraph(f"[{created_at:%d/%m/%Y %H:%M:%S}] {entry}")
+    output = io.BytesIO()
+    document.save(output)
+    return output.getvalue()
+
+
+def _parse_decimal(value):
+    return float(value.replace(",", "."))
+
+
+def _db_rows(query, params=()):
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(query, params)
+            return cursor.fetchall()
+
+
+def _db_execute(query, params=()):
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(query, params)
+            return cursor.fetchone()
+
+
+def _format_rows(title, headers, rows):
+    if not rows:
+        return f"<b>{escape(title)}</b>\nNo hay registros."
+    lines = [f"<b>{escape(title)}</b>"]
+    for row in rows:
+        values = " | ".join(escape(str(value if value is not None else "")) for value in row)
+        lines.append(f"<b>ID {row[0]}</b> | {values.split(' | ', 1)[1] if ' | ' in values else values}")
+    return "\n".join(lines)
+
+
+def handle_personal_command(chat_id, text):
+    parts = text.strip().split(maxsplit=3)
+    command = parts[0].lower()
+    try:
+        if command == "/diario":
+            if len(parts) < 2:
+                send_telegram_message(chat_id, "Uso: /diario <texto>")
+            else:
+                send_telegram_message(chat_id, f"Entrada guardada: {save_diary_entry(text.split(None, 1)[1])}")
+            return True
+        if command == "/diario_exportar":
+            if send_telegram_document(chat_id, build_diary_document(), "diario.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"):
+                send_telegram_message(chat_id, "Diario exportado.")
+            else:
+                send_telegram_message(chat_id, "No pude enviar el diario por Telegram.")
+            return True
+
+        definitions = {
+            "/gasto": ("gastos", "monto, categoria, descripcion", "Gastos", "monto, categoria, descripcion, fecha"),
+            "/presupuesto": ("presupuestos", "categoria, monto_limite", "Presupuestos", "categoria, monto_limite"),
+            "/inventario": ("inventario", "item, cantidad, categoria", "Inventario", "item, cantidad, categoria"),
+            "/contacto": ("contactos", "nombre, telefono, notas", "Contactos", "nombre, telefono, notas"),
+        }
+        base = next((key for key in definitions if command.startswith(key + "_")), None)
+        if not base:
+            return False
+        table, columns, title, list_columns = definitions[base]
+        action = command[len(base) + 1:]
+        if action == "listar":
+            rows = _db_rows(f"SELECT id, {list_columns} FROM {table} ORDER BY id ASC")
+            send_telegram_message(chat_id, _format_rows(title, list_columns, rows), parse_mode="HTML")
+            return True
+        if action == "borrar":
+            if len(parts) < 2 or not parts[1].isdigit():
+                send_telegram_message(chat_id, f"Uso: {command} <id>")
+                return True
+            deleted = _db_execute(f"DELETE FROM {table} WHERE id = %s RETURNING id", (int(parts[1]),))
+            send_telegram_message(chat_id, f"Se eliminó el ID {parts[1]}." if deleted else f"No existe el ID {parts[1]}.")
+            return True
+        if action == "agregar":
+            arguments = text.split(maxsplit=1)[1].split()
+            if base == "/gasto" and len(arguments) >= 2:
+                values = (_parse_decimal(arguments[0]), arguments[1], " ".join(arguments[2:]) or None)
+            elif base == "/presupuesto" and len(arguments) == 2:
+                values = (arguments[0], _parse_decimal(arguments[1]))
+            elif base == "/inventario" and len(arguments) >= 2:
+                values = (arguments[0], int(arguments[1]), " ".join(arguments[2:]) or None)
+            elif base == "/contacto" and len(arguments) >= 2:
+                values = (arguments[0], arguments[1], " ".join(arguments[2:]) or None)
+            else:
+                send_telegram_message(chat_id, f"Uso: {command} <{columns}>")
+                return True
+            placeholders = ", ".join(["%s"] * len(values))
+            _db_execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders}) RETURNING id", values)
+            send_telegram_message(chat_id, f"Registro agregado en {title.lower()}.")
+            return True
+    except (ValueError, RuntimeError):
+        send_telegram_message(chat_id, "Datos inválidos o PostgreSQL no está disponible.")
+        log.exception("Error procesando comando personal %s", command)
+        return True
+    return False
 
 
 init_database()
@@ -991,11 +1145,14 @@ def ask_gemini(chat_id: int, user_text: str) -> str:
     return reply
 
 
-def send_telegram_message(chat_id, text: str):
+def send_telegram_message(chat_id, text: str, parse_mode=None):
     try:
+        payload = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         requests.post(
             f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
+            json=payload,
             timeout=15,
         )
     except requests.RequestException:
@@ -1051,12 +1208,12 @@ def publish_book_cover(file_type: str, file_bytes: bytes, metadata: dict,
         return False
 
 
-def send_telegram_document(chat_id, content: bytes, filename: str) -> bool:
+def send_telegram_document(chat_id, content: bytes, filename: str, mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") -> bool:
     try:
         response = requests.post(
             f"{TELEGRAM_API}/sendDocument",
             data={"chat_id": chat_id},
-            files={"document": (filename, content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            files={"document": (filename, content, mime_type)},
             timeout=30,
         )
         return response.ok and response.json().get("ok", False)
@@ -1434,6 +1591,9 @@ def webhook():
             except Exception:
                 log.exception("Error reiniciando conversación de %s", chat_id)
             send_telegram_message(chat_id, "¡Hola! Soy tu Jarvis. ¿En qué te ayudo?")
+            return jsonify(ok=True)
+
+        if text.startswith("/") and handle_personal_command(chat_id, text):
             return jsonify(ok=True)
 
         # Comandos de administración de canales: solo el dueño puede usarlos
