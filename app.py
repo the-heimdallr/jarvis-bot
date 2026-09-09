@@ -90,6 +90,24 @@ MAX_POSTS_PER_CHANNEL = 30
 MAX_DOC_CHARS = 300_000  # límite de texto por documento (memoria limitada en el plan Free de Render)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+TELEGRAM_COMMANDS = [
+    {"command": "help", "description": "Muestra la lista de ayuda y todos los comandos"},
+    {"command": "libros", "description": "Ver los libros guardados en la biblioteca"},
+    {"command": "exportar_excel", "description": "Descargar la planilla Excel de la base de datos"},
+    {"command": "limpiar_duplicados", "description": "Eliminar registros duplicados"},
+    {"command": "diario", "description": "Agregar una entrada al diario personal"},
+    {"command": "diario_exportar", "description": "Descargar el diario en formato Word (.docx)"},
+    {"command": "gasto_agregar", "description": "Registrar un gasto (<monto> <categoría> <descripción>)"},
+    {"command": "gasto_listar", "description": "Mostrar historial de gastos"},
+    {"command": "gasto_borrar", "description": "Eliminar un gasto por ID (<id>)"},
+    {"command": "presupuesto_agregar", "description": "Definir un límite de presupuesto"},
+    {"command": "presupuesto_listar", "description": "Ver presupuestos actuales"},
+    {"command": "inventario_agregar", "description": "Añadir un ítem al inventario"},
+    {"command": "inventario_listar", "description": "Consultar el inventario"},
+    {"command": "contacto_agregar", "description": "Guardar un contacto"},
+    {"command": "contacto_listar", "description": "Ver lista de contactos guardados"},
+    {"command": "reset", "description": "Reiniciar el hilo de conversación con la IA"},
+]
 CONFIG_KEYS = (
     "PROVEEDOR_PRINCIPAL", "GROQ_API_KEY", "GEMINI_API_KEY", "GEMINI_MODEL",
     "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "DATABASE_URL", "ADMIN_PASSWORD",
@@ -224,6 +242,29 @@ def load_app_config():
     PROVEEDOR_PRINCIPAL = values.get("PROVEEDOR_PRINCIPAL", PROVEEDOR_PRINCIPAL).lower()
     FALLBACK_AUTOMATICO = values.get("FALLBACK_AUTOMATICO", str(FALLBACK_AUTOMATICO)).lower() not in ("0", "false", "no")
     ADMIN_PASSWORD = values.get("ADMIN_PASSWORD", ADMIN_PASSWORD)
+
+
+def register_telegram_commands():
+    """Publica el menú de comandos del bot en Telegram al iniciar la aplicación."""
+    if not TELEGRAM_TOKEN:
+        log.warning("TELEGRAM_TOKEN no está configurado; no se registraron los comandos de Telegram")
+        return False
+    try:
+        response = requests.post(
+            f"{TELEGRAM_API}/setMyCommands",
+            json={"commands": TELEGRAM_COMMANDS},
+            timeout=15,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not result.get("ok"):
+            log.error("Telegram rechazó el registro de comandos: %s", result)
+            return False
+    except (requests.RequestException, ValueError):
+        log.exception("Error registrando los comandos del bot en Telegram")
+        return False
+    log.info("Comandos de Telegram registrados correctamente")
+    return True
 
 
 def save_app_config(values):
@@ -549,6 +590,7 @@ def handle_personal_command(chat_id, text):
 
 init_database()
 load_app_config()
+register_telegram_commands()
 
 # --- Manejo de documentos PDF (biblioteca de estudio) ---
 
