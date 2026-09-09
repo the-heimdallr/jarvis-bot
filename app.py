@@ -23,6 +23,7 @@ import hashlib
 import unicodedata
 import threading
 import logging
+import secrets
 from contextlib import contextmanager
 import requests
 try:
@@ -33,7 +34,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageStat
 from pypdf import PdfReader
 from docx import Document as WordDocument
 from openpyxl import Workbook, load_workbook
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string, Response
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("jarvis-bot")
@@ -43,6 +44,12 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("HUGGINGFACE_API_KEY")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+PROVEEDOR_PRINCIPAL = os.environ.get("PROVEEDOR_PRINCIPAL", "groq").lower()
+FALLBACK_AUTOMATICO = os.environ.get("FALLBACK_AUTOMATICO", "true").lower() not in ("0", "false", "no")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "changeme")
 OWNER_ID = os.environ.get("OWNER_ID")  # tu ID de Telegram (numérico), para que solo vos administres los canales
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -78,9 +85,10 @@ MAX_POSTS_PER_CHANNEL = 30
 MAX_DOC_CHARS = 300_000  # límite de texto por documento (memoria limitada en el plan Free de Render)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-GEMINI_API = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+CONFIG_KEYS = (
+    "PROVEEDOR_PRINCIPAL", "GROQ_API_KEY", "GEMINI_API_KEY", "GEMINI_MODEL",
+    "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "DATABASE_URL", "ADMIN_PASSWORD",
+    "FALLBACK_AUTOMATICO",
 )
 
 # --- Persistencia PostgreSQL ---
@@ -117,6 +125,10 @@ CREATE TABLE IF NOT EXISTS conversations (
     chat_id BIGINT PRIMARY KEY,
     messages JSONB NOT NULL DEFAULT '[]'::jsonb,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS app_config (
+    key TEXT UNIQUE NOT NULL,
+    value TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS channel_posts (
     channel_name TEXT NOT NULL,
@@ -156,6 +168,41 @@ def init_database():
         with connection.cursor() as cursor:
             cursor.execute(SCHEMA_SQL)
     log.info("Base de datos PostgreSQL inicializada")
+
+
+def load_app_config():
+    """Carga configuración persistida, manteniendo las variables de entorno como defaults."""
+    global DATABASE_URL, GEMINI_API_KEY, GEMINI_MODEL, GROQ_API_KEY
+    global OPENROUTER_API_KEY, OPENROUTER_MODEL, PROVEEDOR_PRINCIPAL
+    global FALLBACK_AUTOMATICO, ADMIN_PASSWORD
+    if not DATABASE_URL:
+        return
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT key, value FROM app_config")
+            values = {key: value for key, value in cursor.fetchall()}
+    GEMINI_API_KEY = values.get("GEMINI_API_KEY", GEMINI_API_KEY)
+    GEMINI_MODEL = values.get("GEMINI_MODEL", GEMINI_MODEL)
+    GROQ_API_KEY = values.get("GROQ_API_KEY", GROQ_API_KEY)
+    OPENROUTER_API_KEY = values.get("OPENROUTER_API_KEY", OPENROUTER_API_KEY)
+    OPENROUTER_MODEL = values.get("OPENROUTER_MODEL", OPENROUTER_MODEL)
+    DATABASE_URL = values.get("DATABASE_URL", DATABASE_URL)
+    PROVEEDOR_PRINCIPAL = values.get("PROVEEDOR_PRINCIPAL", PROVEEDOR_PRINCIPAL).lower()
+    FALLBACK_AUTOMATICO = values.get("FALLBACK_AUTOMATICO", str(FALLBACK_AUTOMATICO)).lower() not in ("0", "false", "no")
+    ADMIN_PASSWORD = values.get("ADMIN_PASSWORD", ADMIN_PASSWORD)
+
+
+def save_app_config(values):
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            for key, value in values.items():
+                if key in CONFIG_KEYS:
+                    cursor.execute(
+                        "INSERT INTO app_config (key, value) VALUES (%s, %s) "
+                        "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                        (key, value),
+                    )
+    load_app_config()
 
 
 def save_document(key, title, file_type, text, metadata=None, file_md5=None, source_chat_id=None,
@@ -347,6 +394,7 @@ def get_recent_channel_posts(channel_name):
 
 
 init_database()
+load_app_config()
 
 # --- Manejo de documentos PDF (biblioteca de estudio) ---
 
@@ -743,10 +791,74 @@ class GeminiAPIError(RuntimeError):
     """Error controlado para fallos de configuración, cuota o disponibilidad de Gemini."""
 
 
-def call_gemini(contents: list) -> dict:
-    if not GEMINI_API_KEY:
-        raise GeminiAPIError("Falta configurar GEMINI_API_KEY en las variables de entorno.")
+class ProviderAPIError(RuntimeError):
+    """Error de un proveedor para permitir pasar automáticamente al siguiente."""
 
+
+def _provider_order():
+    providers = ["groq", "gemini", "openrouter"]
+    principal = PROVEEDOR_PRINCIPAL if PROVEEDOR_PRINCIPAL in providers else "groq"
+    ordered = [principal] + [provider for provider in providers if provider != principal]
+    return ordered if FALLBACK_AUTOMATICO else ordered[:1]
+
+
+def _content_to_messages(contents: list) -> list:
+    messages = []
+    for content in contents:
+        role = content.get("role", "user")
+        if role == "model":
+            role = "assistant"
+        text = "".join(part.get("text", "") for part in content.get("parts", []))
+        if text:
+            messages.append({"role": role, "content": text})
+    return messages
+
+
+def _call_groq(contents: list) -> str:
+    if not GROQ_API_KEY:
+        raise ProviderAPIError("GROQ_API_KEY no está configurada")
+    try:
+        from groq import Groq
+        client = Groq(api_key=GROQ_API_KEY)
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=_content_to_messages(contents),
+            temperature=0.3,
+        )
+        return response.choices[0].message.content or ""
+    except Exception as exc:
+        raise ProviderAPIError(f"Groq no disponible: {exc}") from exc
+
+
+def _call_openrouter(contents: list) -> str:
+    if not OPENROUTER_API_KEY:
+        raise ProviderAPIError("OPENROUTER_API_KEY/HUGGINGFACE_API_KEY no está configurada")
+    try:
+        response = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+            json={"model": OPENROUTER_MODEL, "messages": _content_to_messages(contents)},
+            timeout=30,
+        )
+        if not response.ok:
+            raise ProviderAPIError(f"OpenRouter devolvió HTTP {response.status_code}: {response.text[:200]}")
+        return response.json()["choices"][0]["message"].get("content", "")
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        raise ProviderAPIError(f"OpenRouter no disponible: {exc}") from exc
+
+
+def _as_gemini_response(text: str) -> dict:
+    return {"candidates": [{"content": {"role": "model", "parts": [{"text": text}]}}]}
+
+
+def _call_gemini_direct(contents: list) -> dict:
+    if not GEMINI_API_KEY:
+        raise ProviderAPIError("GEMINI_API_KEY no está configurada")
+
+    gemini_api = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
     payload = {
         "contents": contents,
         "tools": TOOLS,
@@ -762,10 +874,10 @@ def call_gemini(contents: list) -> dict:
     }
     for attempt in range(3):
         try:
-            r = requests.post(GEMINI_API, json=payload, timeout=30)
+            r = requests.post(gemini_api, json=payload, timeout=30)
         except requests.RequestException as exc:
             if attempt == 2:
-                raise GeminiAPIError("No se pudo conectar con la API de Gemini.") from exc
+                raise ProviderAPIError("No se pudo conectar con la API de Gemini.") from exc
             time.sleep(2 * (attempt + 1))
             continue
         if r.status_code in (503, 429) and attempt < 2:
@@ -777,21 +889,49 @@ def call_gemini(contents: list) -> dict:
             except ValueError:
                 error_message = ""
             if r.status_code == 429:
-                raise GeminiAPIError("Gemini agotó la cuota disponible. Probá más tarde.")
+                raise ProviderAPIError("Gemini agotó la cuota disponible.")
             if r.status_code == 401 or r.status_code == 403:
-                raise GeminiAPIError("La GEMINI_API_KEY no es válida o no tiene permisos.")
+                raise ProviderAPIError("La GEMINI_API_KEY no es válida o no tiene permisos.")
             if r.status_code == 404:
-                raise GeminiAPIError(
+                raise ProviderAPIError(
                     f"El modelo Gemini '{GEMINI_MODEL}' no está disponible. "
                     "Configurá GEMINI_MODEL con un modelo habilitado."
                 )
             detail = f": {error_message}" if error_message else "."
-            raise GeminiAPIError(f"La API de Gemini devolvió HTTP {r.status_code}{detail}")
+            raise ProviderAPIError(f"La API de Gemini devolvió HTTP {r.status_code}{detail}")
         try:
             return r.json()
         except ValueError as exc:
-            raise GeminiAPIError("Gemini devolvió una respuesta inválida.") from exc
-    raise GeminiAPIError("Gemini no está disponible en este momento.")
+            raise ProviderAPIError("Gemini devolvió una respuesta inválida.") from exc
+    raise ProviderAPIError("Gemini no está disponible en este momento.")
+
+
+def call_gemini(contents: list) -> dict:
+    """Consulta el proveedor principal y aplica fallback, conservando formato Gemini."""
+    errors = []
+    for provider in _provider_order():
+        try:
+            if provider == "groq":
+                return _as_gemini_response(_call_groq(contents))
+            if provider == "openrouter":
+                return _as_gemini_response(_call_openrouter(contents))
+            return _call_gemini_direct(contents)
+        except ProviderAPIError as exc:
+            errors.append(f"{provider}: {exc}")
+            log.warning("Proveedor %s falló; probando el siguiente: %s", provider, exc)
+        except Exception as exc:
+            errors.append(f"{provider}: {exc}")
+            log.exception("Error inesperado en proveedor %s; probando el siguiente", provider)
+    raise GeminiAPIError("No hay proveedores de IA disponibles. " + " | ".join(errors))
+
+
+def preguntar_ia(prompt):
+    """Devuelve una respuesta de texto usando el proveedor configurado y sus respaldos."""
+    data = call_gemini([{"role": "user", "parts": [{"text": str(prompt)}]}])
+    return "".join(
+        part.get("text", "")
+        for part in data["candidates"][0]["content"].get("parts", [])
+    ).strip()
 
 
 def ask_gemini(chat_id: int, user_text: str) -> str:
@@ -1161,6 +1301,73 @@ def handle_owner_command(chat_id: int, text: str) -> bool:
 def health():
     # Render usa esta ruta para saber que el servicio está vivo.
     return jsonify(status="ok", bot="jarvis")
+
+
+ADMIN_HTML = """
+<!doctype html><html lang="es"><head><meta charset="utf-8"><title>Jarvis Admin</title>
+<style>body{font-family:system-ui;max-width:720px;margin:40px auto;padding:0 20px}label{display:block;margin:14px 0 5px}input,select{width:100%;padding:9px;box-sizing:border-box}button{margin-top:20px;padding:10px 18px}.ok{color:green}.error{color:#a00}</style>
+</head><body><h1>Configuración de Jarvis</h1>
+{% if message %}<p class="{{ status }}">{{ message }}</p>{% endif %}
+<form method="post">
+<label>Contraseña de administrador</label><input type="password" name="admin_password" required>
+<label>Proveedor principal</label><select name="PROVEEDOR_PRINCIPAL">
+{% for provider, label in providers %}<option value="{{ provider }}" {% if config.PROVEEDOR_PRINCIPAL == provider %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
+<label>Groq API Key</label><input type="password" name="GROQ_API_KEY" value="{{ config.GROQ_API_KEY }}">
+<label>Gemini API Key</label><input type="password" name="GEMINI_API_KEY" value="{{ config.GEMINI_API_KEY }}">
+<label>Modelo Gemini</label><input name="GEMINI_MODEL" value="{{ config.GEMINI_MODEL }}">
+<label>OpenRouter / HuggingFace API Key</label><input type="password" name="OPENROUTER_API_KEY" value="{{ config.OPENROUTER_API_KEY }}">
+<label>Modelo OpenRouter</label><input name="OPENROUTER_MODEL" value="{{ config.OPENROUTER_MODEL }}">
+<label>DATABASE_URL</label><input name="DATABASE_URL" value="{{ config.DATABASE_URL }}">
+<label><input type="checkbox" name="FALLBACK_AUTOMATICO" {% if config.FALLBACK_AUTOMATICO %}checked{% endif %}> Activar fallback automático</label>
+<button type="submit">Guardar configuración</button></form></body></html>
+"""
+
+
+def _admin_password_valid(password):
+    return bool(ADMIN_PASSWORD and password and secrets.compare_digest(password, ADMIN_PASSWORD))
+
+
+@app.route("/admin", methods=["GET", "POST"])
+def admin():
+    basic_password = request.authorization.password if request.authorization else None
+    submitted_password = request.form.get("admin_password")
+    authenticated = _admin_password_valid(basic_password or submitted_password)
+    config = {
+        "PROVEEDOR_PRINCIPAL": PROVEEDOR_PRINCIPAL,
+        "GROQ_API_KEY": GROQ_API_KEY or "",
+        "GEMINI_API_KEY": GEMINI_API_KEY or "",
+        "GEMINI_MODEL": GEMINI_MODEL,
+        "OPENROUTER_API_KEY": OPENROUTER_API_KEY or "",
+        "OPENROUTER_MODEL": OPENROUTER_MODEL,
+        "DATABASE_URL": DATABASE_URL or "",
+        "FALLBACK_AUTOMATICO": FALLBACK_AUTOMATICO,
+    }
+    if request.method == "POST" and authenticated:
+        values = {key: request.form.get(key, "").strip() for key in CONFIG_KEYS}
+        values["FALLBACK_AUTOMATICO"] = "true" if request.form.get("FALLBACK_AUTOMATICO") else "false"
+        values["ADMIN_PASSWORD"] = ADMIN_PASSWORD or submitted_password
+        try:
+            save_app_config(values)
+            config.update({key: globals().get(key, config.get(key)) for key in config})
+            return render_template_string(
+                ADMIN_HTML, config=config, providers=[("groq", "Groq"), ("gemini", "Gemini"), ("openrouter", "OpenRouter")],
+                message="Configuración guardada.", status="ok",
+            )
+        except Exception:
+            log.exception("Error guardando configuración desde /admin")
+            return render_template_string(
+                ADMIN_HTML, config=config, providers=[("groq", "Groq"), ("gemini", "Gemini"), ("openrouter", "OpenRouter")],
+                message="No se pudo guardar la configuración.", status="error",
+            ), 500
+    if not authenticated:
+        return render_template_string(
+            ADMIN_HTML, config=config, providers=[("groq", "Groq"), ("gemini", "Gemini"), ("openrouter", "OpenRouter")],
+            message="Ingresá la contraseña y enviá el formulario.", status="error",
+        ), 401
+    return render_template_string(
+        ADMIN_HTML, config=config, providers=[("groq", "Groq"), ("gemini", "Gemini"), ("openrouter", "OpenRouter")],
+        message=None, status="",
+    )
 
 
 @app.route(f"/webhook/{WEBHOOK_SECRET if WEBHOOK_SECRET else 'hook'}", methods=["POST"])
