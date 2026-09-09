@@ -43,7 +43,7 @@ app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("HUGGINGFACE_API_KEY")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
@@ -799,6 +799,8 @@ def _provider_order():
     providers = ["groq", "gemini", "openrouter"]
     principal = PROVEEDOR_PRINCIPAL if PROVEEDOR_PRINCIPAL in providers else "groq"
     ordered = [principal] + [provider for provider in providers if provider != principal]
+    if not OPENROUTER_API_KEY:
+        ordered = [provider for provider in ordered if provider != "openrouter"]
     return ordered if FALLBACK_AUTOMATICO else ordered[:1]
 
 
@@ -821,7 +823,7 @@ def _call_groq(contents: list) -> str:
         from groq import Groq
         client = Groq(api_key=GROQ_API_KEY)
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.3-70b-specdec",
             messages=_content_to_messages(contents),
             temperature=0.3,
         )
