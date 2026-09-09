@@ -26,7 +26,10 @@ import logging
 from contextlib import contextmanager
 import requests
 import pandas as pd
-import pymupdf as fitz
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
 from PIL import Image, ImageDraw, ImageFont
 from pypdf import PdfReader
 from docx import Document as WordDocument
