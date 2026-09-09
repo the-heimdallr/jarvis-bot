@@ -47,7 +47,7 @@ app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash-latest")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("HUGGINGFACE_API_KEY")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
@@ -112,6 +112,26 @@ TELEGRAM_COMMANDS = [
     {"command": "recordar_borrar", "description": "Cancelar un recordatorio por ID"},
     {"command": "reset", "description": "Reiniciar el hilo de conversación con la IA"},
 ]
+HELP_TEXT = """Comandos disponibles:
+/help - Muestra esta ayuda
+/libros - Ver los libros guardados en la biblioteca
+/exportar_excel - Descargar la planilla Excel
+/limpiar_duplicados - Eliminar registros duplicados
+/diario <texto> - Agregar una entrada al diario
+/diario_exportar - Descargar el diario en Word
+/gasto_agregar <monto> <categoría> <descripción> - Registrar un gasto
+/gasto_listar - Mostrar historial de gastos
+/gasto_borrar <id> - Eliminar un gasto
+/presupuesto_agregar <categoría> <monto> - Definir un presupuesto
+/presupuesto_listar - Ver presupuestos actuales
+/inventario_agregar <ítem> <cantidad> <categoría> - Añadir un ítem
+/inventario_listar - Consultar el inventario
+/contacto_agregar <nombre> <teléfono> <notas> - Guardar un contacto
+/contacto_listar - Ver lista de contactos
+/recordar <AAAA-MM-DD HH:MM> <mensaje> - Programar un recordatorio
+/recordar_lista - Ver recordatorios pendientes
+/recordar_borrar <id> - Cancelar un recordatorio
+/reset - Reiniciar el hilo de conversación con la IA"""
 CONFIG_KEYS = (
     "PROVEEDOR_PRINCIPAL", "GROQ_API_KEY", "GEMINI_API_KEY", "GEMINI_MODEL",
     "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "DATABASE_URL", "ADMIN_PASSWORD",
@@ -342,13 +362,7 @@ def get_document(key):
 def list_documents():
     with db_connection() as connection:
         with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT storage_key, title, file_type, author, category, edition,
-                      pages, reading_level, rating, file_md5, created_at
-                FROM documents ORDER BY created_at DESC
-                """
-            )
+            cursor.execute("SELECT * FROM documents ORDER BY created_at DESC")
             return cursor.fetchall()
 
 
@@ -589,6 +603,20 @@ def handle_personal_command(chat_id, text):
     parts = text.strip().split(maxsplit=3)
     command = parts[0].lower()
     try:
+        if command == "/help":
+            send_telegram_message(chat_id, HELP_TEXT)
+            return True
+        if command == "/libros":
+            documents = list_documents()
+            if not documents:
+                send_telegram_message(chat_id, "Todavía no aprendí ningún PDF. Reenviame uno.")
+            else:
+                lista = "\n".join(
+                    f"• {row[1]} ({row[3]}) — {row[2]}"
+                    for row in documents
+                )
+                send_telegram_message(chat_id, f"Documentos guardados:\n{lista}")
+            return True
         if command == "/recordar":
             if len(parts) < 4:
                 send_telegram_message(chat_id, "Uso: /recordar <AAAA-MM-DD HH:MM> <mensaje>")
@@ -1124,7 +1152,7 @@ def _call_groq(contents: list) -> str:
         from groq import Groq
         client = Groq(api_key=GROQ_API_KEY)
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             messages=_content_to_messages(contents),
             temperature=0.3,
         )
@@ -1543,11 +1571,7 @@ def handle_owner_command(chat_id: int, text: str) -> bool:
         return True
 
     if cmd == "/resumen" and len(parts) == 2:
-        name = parts[1].lower()
-        if name not in CHANNELS:
-            send_telegram_message(chat_id, f"No conozco el canal '{name}'.")
-        else:
-            send_telegram_message(chat_id, summarize_channel(name))
+        send_telegram_message(chat_id, "El resumen de canales no está disponible como comando local.")
         return True
 
     if cmd == "/libros":
@@ -1614,8 +1638,7 @@ def handle_owner_command(chat_id: int, text: str) -> bool:
         return True
 
     if cmd == "/libro" and len(parts) == 3:
-        key, question = parts[1].lower(), parts[2]
-        send_telegram_message(chat_id, ask_about_document(key, question))
+        send_telegram_message(chat_id, "Usá /libros para consultar la biblioteca.")
         return True
 
     return False
@@ -1740,13 +1763,14 @@ def webhook():
             send_telegram_message(chat_id, "¡Hola! Soy tu Jarvis. ¿En qué te ayudo?")
             return jsonify(ok=True)
 
-        if text.startswith("/") and handle_personal_command(chat_id, text):
-            return jsonify(ok=True)
-
-        # Comandos de administración de canales: solo el dueño puede usarlos
-        if text.startswith("/") and OWNER_ID and sender_id == OWNER_ID:
-            if handle_owner_command(chat_id, text):
+        if text.startswith("/"):
+            if handle_personal_command(chat_id, text):
                 return jsonify(ok=True)
+            # Comandos de administración de canales: solo el dueño puede usarlos.
+            if OWNER_ID and sender_id == OWNER_ID and handle_owner_command(chat_id, text):
+                return jsonify(ok=True)
+            send_telegram_message(chat_id, HELP_TEXT)
+            return jsonify(ok=True)
 
         reply = ask_gemini(chat_id, text)
         send_telegram_message(chat_id, reply)
