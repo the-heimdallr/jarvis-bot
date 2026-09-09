@@ -25,7 +25,6 @@ import threading
 import logging
 from contextlib import contextmanager
 import requests
-import pandas as pd
 try:
     import pymupdf as fitz
 except ImportError:
@@ -33,7 +32,7 @@ except ImportError:
 from PIL import Image, ImageDraw, ImageFont, ImageStat
 from pypdf import PdfReader
 from docx import Document as WordDocument
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from flask import Flask, request, jsonify
 
 logging.basicConfig(level=logging.INFO)
@@ -43,7 +42,7 @@ app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "changeme")
 OWNER_ID = os.environ.get("OWNER_ID")  # tu ID de Telegram (numérico), para que solo vos administres los canales
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -908,33 +907,42 @@ def send_telegram_document(chat_id, content: bytes, filename: str) -> bool:
 
 def export_documents_excel(chat_id: int) -> str:
     try:
-        rows = list_documents()
-        columns = [
-            "Título", "Autor", "Categoría", "Páginas", "Nivel", "MD5", "Fecha",
-        ]
-        dataframe = pd.DataFrame(
-            [
-                {
-                    "Título": title,
-                    "Autor": author,
-                    "Categoría": category,
-                    "Páginas": pages,
-                    "Nivel": reading_level,
-                    "MD5": file_md5,
-                    "Fecha": created_at,
-                }
-                for key, title, file_type, author, category, edition, pages,
-                reading_level, rating, file_md5, created_at in rows
-            ],
-            columns=columns,
-        )
+        with db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT * FROM documents ORDER BY created_at DESC")
+                column_names = [description[0] for description in cursor.description]
+                rows = [dict(zip(column_names, row)) for row in cursor.fetchall()]
+
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Documentos"
+        headers = ["Título", "Autor", "Categoría", "Páginas", "Nivel", "MD5", "Fecha"]
+        worksheet.append(headers)
+        for document in rows:
+            worksheet.append([
+                document.get("title"),
+                document.get("author"),
+                document.get("category"),
+                document.get("pages"),
+                document.get("reading_level"),
+                document.get("file_md5"),
+                document.get("created_at"),
+            ])
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        for column_cells in worksheet.columns:
+            column_letter = column_cells[0].column_letter
+            longest = max(len(str(cell.value or "")) for cell in column_cells)
+            worksheet.column_dimensions[column_letter].width = min(max(longest + 2, 12), 45)
+
         output = io.BytesIO()
-        dataframe.to_excel(output, index=False, engine="openpyxl")
+        workbook.save(output)
         output.seek(0)
         if not send_telegram_document(chat_id, output.getvalue(), "documentos.xlsx"):
             return "Generé el Excel, pero Telegram no pudo enviarlo."
         return "Exportación enviada como documentos.xlsx."
-    except Exception:
+    except Exception as exc:
+        print(f"Error detallado exportando documentos a Excel: {exc}", flush=True)
         log.exception("Error exportando documentos a Excel")
         return "No pude generar la exportación de documentos."
 
