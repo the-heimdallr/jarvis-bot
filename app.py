@@ -28,6 +28,7 @@ from datetime import datetime
 from contextlib import contextmanager
 from html import escape
 from zoneinfo import ZoneInfo
+from apscheduler.schedulers.background import BackgroundScheduler
 import requests
 try:
     import pymupdf as fitz
@@ -46,7 +47,7 @@ app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("HUGGINGFACE_API_KEY")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
@@ -106,6 +107,9 @@ TELEGRAM_COMMANDS = [
     {"command": "inventario_listar", "description": "Consultar el inventario"},
     {"command": "contacto_agregar", "description": "Guardar un contacto"},
     {"command": "contacto_listar", "description": "Ver lista de contactos guardados"},
+    {"command": "recordar", "description": "Programar un recordatorio"},
+    {"command": "recordar_lista", "description": "Ver los recordatorios pendientes"},
+    {"command": "recordar_borrar", "description": "Cancelar un recordatorio por ID"},
     {"command": "reset", "description": "Reiniciar el hilo de conversación con la IA"},
 ]
 CONFIG_KEYS = (
@@ -192,6 +196,15 @@ CREATE TABLE IF NOT EXISTS contactos (
     telefono TEXT,
     notas TEXT
 );
+CREATE TABLE IF NOT EXISTS recordatorios (
+    id SERIAL PRIMARY KEY,
+    chat_id BIGINT NOT NULL,
+    mensaje TEXT NOT NULL,
+    fecha_hora TIMESTAMPTZ NOT NULL,
+    completado BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS recordatorios_pendientes_idx
+    ON recordatorios (fecha_hora) WHERE completado = FALSE;
 """
 
 
@@ -525,10 +538,102 @@ def _format_rows(title, headers, rows):
     return "\n".join(lines)
 
 
+def _parse_reminder_datetime(date_text, time_text):
+    local_datetime = datetime.strptime(
+        f"{date_text} {time_text}", "%Y-%m-%d %H:%M"
+    )
+    return local_datetime.replace(tzinfo=ARGENTINA_TIMEZONE)
+
+
+def process_due_reminders():
+    if not DATABASE_URL:
+        return
+    try:
+        with db_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, chat_id, mensaje FROM recordatorios "
+                    "WHERE NOT completado AND fecha_hora <= NOW() "
+                    "ORDER BY fecha_hora ASC"
+                )
+                due_reminders = cursor.fetchall()
+                for reminder_id, chat_id, message in due_reminders:
+                    send_telegram_message(chat_id, f"⏰ Recordatorio: {message}")
+                    cursor.execute(
+                        "UPDATE recordatorios SET completado = TRUE WHERE id = %s",
+                        (reminder_id,),
+                    )
+    except Exception:
+        log.exception("Error procesando recordatorios pendientes")
+
+
+reminder_scheduler = BackgroundScheduler(timezone=ARGENTINA_TIMEZONE)
+
+
+def start_reminder_scheduler():
+    if not DATABASE_URL:
+        log.warning("DATABASE_URL no está configurada; los recordatorios están deshabilitados")
+        return
+    reminder_scheduler.add_job(
+        process_due_reminders,
+        "interval",
+        seconds=30,
+        id="process_due_reminders",
+        replace_existing=True,
+    )
+    reminder_scheduler.start()
+    log.info("Scheduler de recordatorios iniciado")
+
+
 def handle_personal_command(chat_id, text):
     parts = text.strip().split(maxsplit=3)
     command = parts[0].lower()
     try:
+        if command == "/recordar":
+            if len(parts) < 4:
+                send_telegram_message(chat_id, "Uso: /recordar <AAAA-MM-DD HH:MM> <mensaje>")
+                return True
+            reminder_datetime = _parse_reminder_datetime(parts[1], parts[2])
+            _db_execute(
+                "INSERT INTO recordatorios (chat_id, mensaje, fecha_hora) "
+                "VALUES (%s, %s, %s) RETURNING id",
+                (chat_id, parts[3], reminder_datetime),
+            )
+            send_telegram_message(
+                chat_id,
+                f"Recordatorio programado para {reminder_datetime:%d/%m/%Y %H:%M}.",
+            )
+            return True
+        if command == "/recordar_lista":
+            rows = _db_rows(
+                "SELECT id, mensaje, fecha_hora FROM recordatorios "
+                "WHERE chat_id = %s AND NOT completado ORDER BY fecha_hora ASC",
+                (chat_id,),
+            )
+            if not rows:
+                send_telegram_message(chat_id, "No tenés recordatorios pendientes.")
+            else:
+                lines = [
+                    f"ID {reminder_id} | {message} | "
+                    f"{reminder_datetime.astimezone(ARGENTINA_TIMEZONE):%d/%m/%Y %H:%M}"
+                    for reminder_id, message, reminder_datetime in rows
+                ]
+                send_telegram_message(chat_id, "Recordatorios pendientes:\n" + "\n".join(lines))
+            return True
+        if command == "/recordar_borrar":
+            if len(parts) < 2 or not parts[1].isdigit():
+                send_telegram_message(chat_id, "Uso: /recordar_borrar <id>")
+                return True
+            deleted = _db_execute(
+                "DELETE FROM recordatorios WHERE id = %s AND chat_id = %s RETURNING id",
+                (int(parts[1]), chat_id),
+            )
+            send_telegram_message(
+                chat_id,
+                f"Recordatorio {parts[1]} cancelado." if deleted
+                else f"No existe un recordatorio pendiente con ID {parts[1]}.",
+            )
+            return True
         if command == "/diario":
             if len(parts) < 2:
                 send_telegram_message(chat_id, "Uso: /diario <texto>")
@@ -1019,7 +1124,7 @@ def _call_groq(contents: list) -> str:
         from groq import Groq
         client = Groq(api_key=GROQ_API_KEY)
         response = client.chat.completions.create(
-            model="llama-3.3-70b-specdec",
+            model="llama-3.3-70b-versatile",
             messages=_content_to_messages(contents),
             temperature=0.3,
         )
@@ -1666,6 +1771,9 @@ def handle_uncaught_error(exc):
     if request.path.startswith("/webhook"):
         return jsonify(ok=True)
     return jsonify(error="internal_error"), 500
+
+
+start_reminder_scheduler()
 
 
 if __name__ == "__main__":
