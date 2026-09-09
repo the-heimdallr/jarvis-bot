@@ -30,7 +30,7 @@ try:
     import pymupdf as fitz
 except ImportError:
     import fitz
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageStat
 from pypdf import PdfReader
 from docx import Document as WordDocument
 from openpyxl import load_workbook
@@ -210,7 +210,7 @@ def list_documents():
             cursor.execute(
                 """
                 SELECT storage_key, title, file_type, author, category, edition,
-                       pages, reading_level, rating, created_at
+                      pages, reading_level, rating, file_md5, created_at
                 FROM documents ORDER BY created_at DESC
                 """
             )
@@ -378,35 +378,77 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     return "\n".join(text_parts)[:MAX_DOC_CHARS]
 
 
-def render_pdf_cover(pdf_bytes: bytes) -> bytes:
+def render_pdf_cover(pdf_bytes: bytes) -> bytes | None:
     document = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         if not document.page_count:
             raise ValueError("El PDF no contiene páginas")
         page = document.load_page(0)
+        if not page.get_images(full=True):
+            return None
         pixmap = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
+        preview = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+        preview.thumbnail((160, 220))
+        light_pixels = ImageStat.Stat(preview.convert("L")).mean[0]
+        if light_pixels >= 238:
+            return None
         return pixmap.tobytes("jpg", jpg_quality=92)
     finally:
         document.close()
 
 
-def create_cover_banner(title: str, author: str | None) -> bytes:
-    image = Image.new("RGB", (1200, 1600), (24, 39, 58))
+def create_cover_banner(title: str, author: str | None, category: str | None = None) -> bytes:
+    category_key = (category or "").lower()
+    palettes = {
+        "ciencia": ((25, 54, 61), (115, 193, 184), (237, 245, 235)),
+        "historia": ((76, 46, 39), (211, 164, 95), (250, 235, 204)),
+        "literatura": ((48, 38, 68), (199, 151, 184), (248, 235, 241)),
+        "derecho": ((29, 49, 67), (190, 166, 104), (239, 238, 222)),
+        "tecnologia": ((23, 42, 57), (82, 183, 214), (229, 245, 249)),
+    }
+    palette = next(
+        (colors for key, colors in palettes.items() if key in category_key),
+        ((30, 43, 58), (216, 169, 84), (245, 241, 228)),
+    )
+    background, accent, text_color = palette
+    image = Image.new("RGB", (1200, 1600), background)
     draw = ImageDraw.Draw(image)
     title_font = ImageFont.truetype(
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 72
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 70
     )
     author_font = ImageFont.truetype(
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 42
     )
-    margin = 100
-    draw.rectangle((margin, 260, 1100, 1340), outline=(226, 184, 92), width=6)
+    small_font = ImageFont.truetype(
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 26
+    )
+    margin = 78
+    draw.rectangle((margin, margin, 1200 - margin, 1600 - margin), outline=accent, width=5)
+    draw.rectangle((margin + 22, margin + 22, 1200 - margin - 22, 1600 - margin - 22),
+                   outline=accent, width=1)
+    draw.line((250, 300, 950, 300), fill=accent, width=3)
+    draw.line((250, 1300, 950, 1300), fill=accent, width=3)
+    if category:
+        draw.text((600, 220), category[:40].upper(), font=small_font, fill=accent, anchor="mm")
+    words = title[:140].split()
+    title_lines = []
+    line = ""
+    for word in words:
+        candidate = f"{line} {word}".strip()
+        if draw.textbbox((0, 0), candidate, font=title_font)[2] <= 920:
+            line = candidate
+        else:
+            if line:
+                title_lines.append(line)
+            line = word
+    if line:
+        title_lines.append(line)
     draw.multiline_text(
-        (margin + 70, 470), title[:120], font=title_font, fill=(248, 244, 232),
-        spacing=18, align="center", anchor="ma",
+        (600, 760), "\n".join(title_lines), font=title_font, fill=text_color,
+        spacing=22, align="center", anchor="mm",
     )
     if author:
-        draw.text((600, 1160), author[:100], font=author_font, fill=(226, 184, 92), anchor="mm")
+        draw.text((600, 1390), author[:100], font=author_font, fill=accent, anchor="mm")
     output = io.BytesIO()
     image.save(output, format="JPEG", quality=92, optimize=True)
     return output.getvalue()
@@ -415,10 +457,17 @@ def create_cover_banner(title: str, author: str | None) -> bytes:
 def build_book_cover(file_type: str, file_bytes: bytes, metadata: dict) -> bytes:
     if file_type == "pdf":
         try:
-            return render_pdf_cover(file_bytes)
+            rendered_cover = render_pdf_cover(file_bytes)
+            if rendered_cover:
+                return rendered_cover
+            log.info("La primera página PDF no parece una portada visual; se generará una portada nueva")
         except Exception:
             log.exception("No se pudo renderizar la portada PDF")
-    return create_cover_banner(metadata.get("title", "Libro"), metadata.get("author"))
+    return create_cover_banner(
+        metadata.get("title", "Libro"),
+        metadata.get("author"),
+        metadata.get("category"),
+    )
 
 
 def extract_word_text(document_bytes: bytes) -> str:
@@ -805,45 +854,43 @@ def publish_book_cover(file_type: str, file_bytes: bytes, metadata: dict,
         return False
 
 
-def send_telegram_document(chat_id, content: bytes, filename: str):
-    requests.post(
+def send_telegram_document(chat_id, content: bytes, filename: str) -> bool:
+    response = requests.post(
         f"{TELEGRAM_API}/sendDocument",
         data={"chat_id": chat_id},
         files={"document": (filename, content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
         timeout=30,
     )
+    return response.ok and response.json().get("ok", False)
 
 
 def export_documents_excel(chat_id: int) -> str:
     try:
         rows = list_documents()
         columns = [
-            "id", "título", "tipo", "autor", "categoría", "edición", "páginas",
-            "nivel_de_lectura", "valoración", "fecha",
+            "Título", "Autor", "Categoría", "Páginas", "Nivel", "MD5", "Fecha",
         ]
         dataframe = pd.DataFrame(
             [
                 {
-                    "id": key,
-                    "título": title,
-                    "tipo": file_type,
-                    "autor": author,
-                    "categoría": category,
-                    "edición": edition,
-                    "páginas": pages,
-                    "nivel_de_lectura": reading_level,
-                    "valoración": rating,
-                    "fecha": created_at,
+                    "Título": title,
+                    "Autor": author,
+                    "Categoría": category,
+                    "Páginas": pages,
+                    "Nivel": reading_level,
+                    "MD5": file_md5,
+                    "Fecha": created_at,
                 }
                 for key, title, file_type, author, category, edition, pages,
-                reading_level, rating, created_at in rows
+                reading_level, rating, file_md5, created_at in rows
             ],
             columns=columns,
         )
         output = io.BytesIO()
         dataframe.to_excel(output, index=False, engine="openpyxl")
         output.seek(0)
-        send_telegram_document(chat_id, output.getvalue(), "documentos.xlsx")
+        if not send_telegram_document(chat_id, output.getvalue(), "documentos.xlsx"):
+            return "Generé el Excel, pero Telegram no pudo enviarlo."
         return "Exportación enviada como documentos.xlsx."
     except Exception:
         log.exception("Error exportando documentos a Excel")
