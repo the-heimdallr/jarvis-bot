@@ -19,11 +19,15 @@ import time
 import gc
 import csv
 import json
+import hashlib
 import unicodedata
 import threading
 import logging
 from contextlib import contextmanager
 import requests
+import pandas as pd
+import pymupdf as fitz
+from PIL import Image, ImageDraw, ImageFont
 from pypdf import PdfReader
 from docx import Document as WordDocument
 from openpyxl import load_workbook
@@ -52,6 +56,20 @@ def _parse_channels():
 
 CHANNELS = _parse_channels()
 
+
+def _parse_channel_themes():
+    raw = os.environ.get("CHANNEL_THEMES", "")
+    themes = {}
+    for pair in raw.split(","):
+        if ":" in pair:
+            name, theme = pair.split(":", 1)
+            themes[name.strip().lower()] = theme.strip()
+    return themes
+
+
+CHANNEL_THEMES = _parse_channel_themes()
+BOOK_CHANNEL = os.environ.get("BOOK_CHANNEL", "").strip().lower()
+
 MAX_POSTS_PER_CHANNEL = 30
 
 MAX_DOC_CHARS = 300_000  # límite de texto por documento (memoria limitada en el plan Free de Render)
@@ -74,8 +92,23 @@ CREATE TABLE IF NOT EXISTS documents (
     source_chat_id BIGINT,
     source_message_id BIGINT,
     source_channel_name TEXT,
+    file_md5 CHAR(32),
+    author TEXT,
+    category TEXT,
+    edition TEXT,
+    pages INTEGER,
+    reading_level TEXT,
+    rating INTEGER CHECK (rating BETWEEN 1 AND 5),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS author TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS category TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS edition TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS pages INTEGER;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS reading_level TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS rating INTEGER;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_md5 CHAR(32);
+CREATE INDEX IF NOT EXISTS documents_file_md5_idx ON documents (file_md5);
 CREATE INDEX IF NOT EXISTS documents_created_at_idx ON documents (created_at DESC);
 CREATE TABLE IF NOT EXISTS conversations (
     chat_id BIGINT PRIMARY KEY,
@@ -122,16 +155,18 @@ def init_database():
     log.info("Base de datos PostgreSQL inicializada")
 
 
-def save_document(key, title, file_type, text, source_chat_id=None,
+def save_document(key, title, file_type, text, metadata=None, file_md5=None, source_chat_id=None,
                   source_message_id=None, source_channel_name=None):
+    metadata = metadata or {}
     with db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
                 INSERT INTO documents
                     (storage_key, title, file_type, text_content, source_chat_id,
-                     source_message_id, source_channel_name)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    source_message_id, source_channel_name, file_md5, author, category,
+                     edition, pages, reading_level, rating)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (storage_key) DO UPDATE SET
                     title = EXCLUDED.title,
                     file_type = EXCLUDED.file_type,
@@ -139,9 +174,19 @@ def save_document(key, title, file_type, text, source_chat_id=None,
                     source_chat_id = EXCLUDED.source_chat_id,
                     source_message_id = EXCLUDED.source_message_id,
                     source_channel_name = EXCLUDED.source_channel_name,
+                    file_md5 = EXCLUDED.file_md5,
+                    author = EXCLUDED.author,
+                    category = EXCLUDED.category,
+                    edition = EXCLUDED.edition,
+                    pages = EXCLUDED.pages,
+                    reading_level = EXCLUDED.reading_level,
+                    rating = EXCLUDED.rating,
                     created_at = NOW()
                 """,
-                (key, title, file_type, text, source_chat_id, source_message_id, source_channel_name),
+                (key, metadata.get("title") or title, file_type, text, source_chat_id,
+                 source_message_id, source_channel_name, file_md5, metadata.get("author"),
+                 metadata.get("category"), metadata.get("edition"), metadata.get("pages"),
+                 metadata.get("reading_level"), metadata.get("rating")),
             )
 
 
@@ -160,9 +205,76 @@ def list_documents():
     with db_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT storage_key, title, file_type FROM documents ORDER BY created_at DESC"
+                """
+                SELECT storage_key, title, file_type, author, category, edition,
+                       pages, reading_level, rating, created_at
+                FROM documents ORDER BY created_at DESC
+                """
             )
             return cursor.fetchall()
+
+
+def find_duplicate_document(file_md5: str, title: str):
+    normalized_title = title.strip()
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT title FROM documents
+                WHERE (%s IS NOT NULL AND file_md5 = %s)
+                   OR LOWER(BTRIM(title)) = LOWER(BTRIM(%s))
+                ORDER BY created_at ASC LIMIT 1
+                """,
+                (file_md5, file_md5, normalized_title),
+            )
+            row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def clean_duplicate_documents():
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH ranked AS (
+                    SELECT id, title,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY LOWER(BTRIM(title))
+                               ORDER BY created_at ASC, id ASC
+                           ) AS title_rank,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY file_md5
+                               ORDER BY created_at ASC, id ASC
+                           ) AS hash_rank
+                    FROM documents
+                    WHERE file_md5 IS NOT NULL OR title IS NOT NULL
+                ), duplicates AS (
+                    SELECT id, title FROM ranked
+                    WHERE title_rank > 1 OR (file_md5 IS NOT NULL AND hash_rank > 1)
+                )
+                DELETE FROM documents AS document
+                USING duplicates
+                WHERE document.id = duplicates.id
+                RETURNING duplicates.title
+                """
+            )
+            return [row[0] for row in cursor.fetchall()]
+
+
+def delete_document(identifier: str):
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            if identifier.isdigit():
+                cursor.execute(
+                    "DELETE FROM documents WHERE id = %s OR source_message_id = %s RETURNING title, source_chat_id, source_message_id",
+                    (int(identifier), int(identifier)),
+                )
+            else:
+                cursor.execute(
+                    "DELETE FROM documents WHERE storage_key = %s OR title ILIKE %s RETURNING title, source_chat_id, source_message_id",
+                    (identifier.lower(), identifier),
+                )
+            return cursor.fetchone()
 
 
 def load_conversation(chat_id):
@@ -263,6 +375,49 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     return "\n".join(text_parts)[:MAX_DOC_CHARS]
 
 
+def render_pdf_cover(pdf_bytes: bytes) -> bytes:
+    document = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        if not document.page_count:
+            raise ValueError("El PDF no contiene páginas")
+        page = document.load_page(0)
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
+        return pixmap.tobytes("jpg", jpg_quality=92)
+    finally:
+        document.close()
+
+
+def create_cover_banner(title: str, author: str | None) -> bytes:
+    image = Image.new("RGB", (1200, 1600), (24, 39, 58))
+    draw = ImageDraw.Draw(image)
+    title_font = ImageFont.truetype(
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 72
+    )
+    author_font = ImageFont.truetype(
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 42
+    )
+    margin = 100
+    draw.rectangle((margin, 260, 1100, 1340), outline=(226, 184, 92), width=6)
+    draw.multiline_text(
+        (margin + 70, 470), title[:120], font=title_font, fill=(248, 244, 232),
+        spacing=18, align="center", anchor="ma",
+    )
+    if author:
+        draw.text((600, 1160), author[:100], font=author_font, fill=(226, 184, 92), anchor="mm")
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=92, optimize=True)
+    return output.getvalue()
+
+
+def build_book_cover(file_type: str, file_bytes: bytes, metadata: dict) -> bytes:
+    if file_type == "pdf":
+        try:
+            return render_pdf_cover(file_bytes)
+        except Exception:
+            log.exception("No se pudo renderizar la portada PDF")
+    return create_cover_banner(metadata.get("title", "Libro"), metadata.get("author"))
+
+
 def extract_word_text(document_bytes: bytes) -> str:
     document = WordDocument(io.BytesIO(document_bytes))
     parts = [paragraph.text for paragraph in document.paragraphs]
@@ -307,6 +462,81 @@ def document_type(file_name: str):
     }.get(extension)
 
 
+def analyze_document_metadata(text: str, file_name: str) -> dict:
+    prompt = (
+        "Analizá el contenido del documento y devolvé únicamente un objeto JSON válido, "
+        "sin markdown, con estas claves exactas: title (string), author (string o null), "
+        "category (string o null), edition (string o null), pages (entero o null), "
+        "reading_level (string o null), rating (entero de 1 a 5 o null). "
+        "Estimá los valores solo cuando haya indicios razonables; rating es una valoración "
+        "general de utilidad/calidad del material, no una certeza bibliográfica.\n\n"
+        f"NOMBRE DEL ARCHIVO: {file_name}\nCONTENIDO:\n{text[:MAX_DOC_CHARS]}"
+    )
+    try:
+        data = call_gemini([{"role": "user", "parts": [{"text": prompt}]}])
+        parts = data["candidates"][0]["content"].get("parts", [])
+        response = "".join(part.get("text", "") for part in parts).strip()
+        response = re.sub(r"^```(?:json)?\s*|\s*```$", "", response, flags=re.IGNORECASE)
+        metadata = json.loads(response)
+        if not isinstance(metadata, dict):
+            raise ValueError("Gemini no devolvió un objeto")
+    except Exception:
+        log.exception("Error extrayendo metadatos de %s", file_name)
+        return {"title": file_name}
+
+    if metadata.get("pages") is not None:
+        try:
+            metadata["pages"] = max(0, int(metadata["pages"]))
+        except (TypeError, ValueError):
+            metadata["pages"] = None
+    if metadata.get("rating") is not None:
+        try:
+            metadata["rating"] = min(5, max(1, int(metadata["rating"])))
+        except (TypeError, ValueError):
+            metadata["rating"] = None
+    metadata["title"] = str(metadata.get("title") or file_name)
+    return metadata
+
+
+def generate_book_summary(text: str, metadata: dict) -> str:
+    prompt = (
+        "Escribí un resumen breve en español, de máximo 280 caracteres, para el pie de foto "
+        "de una portada de libro. No inventes datos que no estén en el contenido. "
+        f"Título: {metadata.get('title', 'sin título')}\nCONTENIDO:\n{text[:12000]}"
+    )
+    try:
+        data = call_gemini([{"role": "user", "parts": [{"text": prompt}]}])
+        parts = data["candidates"][0]["content"].get("parts", [])
+        return "".join(part.get("text", "") for part in parts).strip()[:280]
+    except Exception:
+        log.exception("Error generando resumen de %s", metadata.get("title"))
+        return "Resumen no disponible."
+
+
+def evaluate_channel_content(channel_name: str, content: str) -> dict:
+    theme = CHANNEL_THEMES.get(channel_name)
+    if not theme:
+        return {"matches": True, "reason": "El canal no tiene temática configurada."}
+    prompt = (
+        "Compará el contenido con la temática del canal. Devolvé únicamente JSON válido "
+        "con las claves matches (boolean) y reason (string breve en español). "
+        f"TEMÁTICA DEL CANAL: {theme}\nCONTENIDO:\n{content[:12000]}"
+    )
+    try:
+        data = call_gemini([{"role": "user", "parts": [{"text": prompt}]}])
+        parts = data["candidates"][0]["content"].get("parts", [])
+        response = "".join(part.get("text", "") for part in parts).strip()
+        response = re.sub(r"^```(?:json)?\s*|\s*```$", "", response, flags=re.IGNORECASE)
+        result = json.loads(response)
+        return {
+            "matches": bool(result.get("matches", True)),
+            "reason": str(result.get("reason", "Sin explicación.")),
+        }
+    except Exception:
+        log.exception("Error moderando contenido del canal %s", channel_name)
+        return {"matches": True, "reason": "No se pudo evaluar automáticamente."}
+
+
 def process_document_async(document: dict, notify_chat_id, source_message=None, source_channel_name=None):
     resultado = handle_incoming_document(document, source_message, source_channel_name)
     send_telegram_message(notify_chat_id, resultado)
@@ -320,6 +550,10 @@ def handle_incoming_document(document: dict, source_message=None, source_channel
 
     try:
         file_bytes = download_telegram_file(document["file_id"])
+        file_md5 = hashlib.md5(file_bytes).hexdigest()
+        duplicate_title = find_duplicate_document(file_md5, "")
+        if duplicate_title:
+            return f"El libro '{duplicate_title}' ya se encuentra en la biblioteca (Duplicado)."
         extractors = {
             "pdf": lambda: extract_pdf_text(file_bytes),
             "docx": lambda: extract_word_text(file_bytes),
@@ -337,15 +571,33 @@ def handle_incoming_document(document: dict, source_message=None, source_channel
     key = slugify(file_name.rsplit(".", 1)[0])
     source_chat_id = source_message.get("chat", {}).get("id") if source_message else None
     source_message_id = source_message.get("message_id") if source_message else None
+    metadata = analyze_document_metadata(text, file_name)
+    duplicate_title = find_duplicate_document(file_md5, metadata.get("title") or file_name)
+    if duplicate_title:
+        return f"El libro '{duplicate_title}' ya se encuentra en la biblioteca (Duplicado)."
+    if source_channel_name and OWNER_ID:
+        evaluation = evaluate_channel_content(source_channel_name, text)
+        if not evaluation["matches"]:
+            send_telegram_message(
+                OWNER_ID,
+                f"Aviso: material posiblemente fuera de tema en '{source_channel_name}'.\n"
+                f"Archivo: {file_name}\nMotivo: {evaluation['reason']}\n"
+                f"Mensaje: {source_message_id or 'desconocido'}",
+            )
     try:
-        save_document(key, file_name, file_type, text, source_chat_id, source_message_id, source_channel_name)
+        save_document(key, file_name, file_type, text, metadata, file_md5, source_chat_id,
+                      source_message_id, source_channel_name)
     except Exception:
         log.exception("Error guardando documento %s en PostgreSQL", file_name)
         return f"Procesé '{file_name}', pero no pude guardarlo en PostgreSQL."
+    cover_published = publish_book_cover(
+        file_type, file_bytes, metadata, text, source_channel_name
+    )
+    cover_status = " La portada fue publicada en el canal." if cover_published else ""
     return (
         f"Guardé '{file_name}' ({len(text):,} caracteres) en PostgreSQL.\n"
         f"Preguntame con: /libro {key} tu pregunta\n"
-        f"Ver todos: /libros"
+        f"Ver todos: /libros{cover_status}"
     )
 
 
@@ -516,6 +768,117 @@ def send_telegram_message(chat_id, text: str):
     )
 
 
+def send_telegram_photo(channel_id, cover: bytes, caption: str) -> bool:
+    response = requests.post(
+        f"{TELEGRAM_API}/sendPhoto",
+        data={"chat_id": channel_id, "caption": caption},
+        files={"photo": ("portada.jpg", cover, "image/jpeg")},
+        timeout=30,
+    )
+    return response.ok and response.json().get("ok", False)
+
+
+def publish_book_cover(file_type: str, file_bytes: bytes, metadata: dict,
+                       text: str, source_channel_name: str | None = None) -> bool:
+    channel_name = source_channel_name or BOOK_CHANNEL
+    if not channel_name or channel_name not in CHANNELS:
+        log.info("No hay canal de libros configurado para publicar la portada")
+        return False
+
+    stars = "⭐" * int(metadata.get("rating") or 0) or "Sin valoración"
+    summary = generate_book_summary(text, metadata)
+    caption = (
+        f"📚 {metadata.get('title', 'Sin título')}\n"
+        f"Autor: {metadata.get('author') or 'Desconocido'}\n"
+        f"Categoría: {metadata.get('category') or 'Sin categoría'}\n"
+        f"Valoración: {stars}\n\n"
+        f"{summary}"
+    )
+    try:
+        cover = build_book_cover(file_type, file_bytes, metadata)
+        return send_telegram_photo(CHANNELS[channel_name], cover, caption)
+    except Exception:
+        log.exception("Error publicando la portada de %s", metadata.get("title"))
+        return False
+
+
+def send_telegram_document(chat_id, content: bytes, filename: str):
+    requests.post(
+        f"{TELEGRAM_API}/sendDocument",
+        data={"chat_id": chat_id},
+        files={"document": (filename, content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        timeout=30,
+    )
+
+
+def export_documents_excel(chat_id: int) -> str:
+    try:
+        rows = list_documents()
+        columns = [
+            "id", "título", "tipo", "autor", "categoría", "edición", "páginas",
+            "nivel_de_lectura", "valoración", "fecha",
+        ]
+        dataframe = pd.DataFrame(
+            [
+                {
+                    "id": key,
+                    "título": title,
+                    "tipo": file_type,
+                    "autor": author,
+                    "categoría": category,
+                    "edición": edition,
+                    "páginas": pages,
+                    "nivel_de_lectura": reading_level,
+                    "valoración": rating,
+                    "fecha": created_at,
+                }
+                for key, title, file_type, author, category, edition, pages,
+                reading_level, rating, created_at in rows
+            ],
+            columns=columns,
+        )
+        output = io.BytesIO()
+        dataframe.to_excel(output, index=False, engine="openpyxl")
+        output.seek(0)
+        send_telegram_document(chat_id, output.getvalue(), "documentos.xlsx")
+        return "Exportación enviada como documentos.xlsx."
+    except Exception:
+        log.exception("Error exportando documentos a Excel")
+        return "No pude generar la exportación de documentos."
+
+
+def delete_telegram_message(chat_id, message_id) -> bool:
+    response = requests.post(
+        f"{TELEGRAM_API}/deleteMessage",
+        json={"chat_id": chat_id, "message_id": int(message_id)},
+        timeout=15,
+    )
+    return response.ok and response.json().get("ok", False)
+
+
+def delete_message_from_configured_channels(message_id: str) -> bool:
+    for channel_id in CHANNELS.values():
+        try:
+            if delete_telegram_message(channel_id, message_id):
+                return True
+        except Exception:
+            log.exception("Error eliminando mensaje %s del canal %s", message_id, channel_id)
+    return False
+
+
+def moderate_text_post(channel_name: str, post: dict, text: str):
+    if not OWNER_ID:
+        return
+    evaluation = evaluate_channel_content(channel_name, text)
+    if not evaluation["matches"]:
+        send_telegram_message(
+            OWNER_ID,
+            f"Aviso: post posiblemente fuera de tema en '{channel_name}'.\n"
+            f"Mensaje: {post.get('message_id', 'desconocido')}\n"
+            f"Contenido: {text[:1000]}\nMotivo: {evaluation['reason']}",
+        )
+
+
 def pin_last_message(channel_name: str) -> str:
     posts = get_recent_channel_posts(channel_name)
     if not posts:
@@ -577,6 +940,12 @@ def handle_channel_post(post: dict):
 
     text = post.get("text") or post.get("caption") or ""
     save_channel_post(name, chat_id_str, post["message_id"], text)
+    if text:
+        threading.Thread(
+            target=moderate_text_post,
+            args=(name, post, text),
+            daemon=True,
+        ).start()
 
 
 def handle_owner_command(chat_id: int, text: str) -> bool:
@@ -624,9 +993,60 @@ def handle_owner_command(chat_id: int, text: str) -> bool:
         else:
             lista = "\n".join(
                 f"• {key} ({file_type}) — {title}"
-                for key, title, file_type in documents
+                for key, title, file_type, *_ in documents
             )
             send_telegram_message(chat_id, f"Documentos guardados:\n{lista}")
+        return True
+
+    if cmd == "/exportar_excel":
+        send_telegram_message(chat_id, export_documents_excel(chat_id))
+        return True
+
+    if cmd == "/limpiar_duplicados":
+        try:
+            deleted_titles = clean_duplicate_documents()
+        except Exception:
+            log.exception("Error limpiando documentos duplicados")
+            send_telegram_message(chat_id, "No pude escanear y limpiar los duplicados en PostgreSQL.")
+            return True
+        if not deleted_titles:
+            send_telegram_message(chat_id, "No encontré libros duplicados en la biblioteca.")
+        else:
+            report = "\n".join(f"• {title}" for title in deleted_titles)
+            send_telegram_message(
+                chat_id,
+                f"Eliminé {len(deleted_titles)} registro(s) duplicado(s):\n{report}",
+            )
+        return True
+
+    if cmd == "/borrar_libro" and len(parts) >= 2:
+        identifier = " ".join(parts[1:]).strip()
+        try:
+            deleted = delete_document(identifier)
+        except Exception:
+            log.exception("Error eliminando documento %s", identifier)
+            send_telegram_message(chat_id, "No pude eliminar el documento de PostgreSQL.")
+            return True
+        if not deleted and identifier.isdigit():
+            if delete_message_from_configured_channels(identifier):
+                send_telegram_message(chat_id, f"Eliminé el mensaje {identifier} de Telegram.")
+            else:
+                send_telegram_message(chat_id, f"No encontré un documento ni un mensaje con '{identifier}'.")
+            return True
+        if not deleted:
+            send_telegram_message(chat_id, f"No encontré un documento con '{identifier}'.")
+            return True
+        title, source_chat_id, source_message_id = deleted
+        telegram_deleted = False
+        if source_chat_id and source_message_id:
+            try:
+                telegram_deleted = delete_telegram_message(source_chat_id, source_message_id)
+            except Exception:
+                log.exception("Error eliminando mensaje %s del canal", source_message_id)
+        elif identifier.isdigit():
+            telegram_deleted = delete_message_from_configured_channels(identifier)
+        suffix = " y el post de Telegram" if telegram_deleted else ""
+        send_telegram_message(chat_id, f"Eliminé '{title}' de PostgreSQL{suffix}.")
         return True
 
     if cmd == "/libro" and len(parts) == 3:

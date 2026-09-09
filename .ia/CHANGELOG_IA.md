@@ -1,15 +1,17 @@
 # Changelog de IA
 
-## 2026-09-08 - Persistencia y documentos multiformato
+## 2026-09-09
 
-- Añadida conexión PostgreSQL mediante `DATABASE_URL`.
-- Creadas las tablas `documents`, `conversations` y `channel_posts` al iniciar la aplicación.
-- Migrados a PostgreSQL los documentos, el historial de conversación y las publicaciones recientes de canales.
-- Añadida extracción de PDF, DOCX, CSV, XLSX y XLSM.
-- Añadidas `psycopg2-binary`, `python-docx` y `openpyxl` a `requirements.txt`.
-- Guardados metadatos de chat, mensaje y canal para documentos recibidos desde Telegram.
-- Validada la sintaxis de `app.py` y la extracción funcional de DOCX, XLSX y CSV.
-- Los datos que solo estaban en RAM antes de esta migración no pueden recuperarse automáticamente.
+- Ampliada `documents` con autor, categoría, edición, páginas, nivel de lectura y valoración de 1 a 5.
+- Añadido análisis JSON de metadatos mediante Gemini al recibir documentos.
+- Añadido `/exportar_excel`, restringido a `OWNER_ID`, con envío de `documentos.xlsx` por Telegram.
+- Añadido `/borrar_libro <nombre_o_id>` para eliminar el registro y el mensaje de canal cuando existe su origen.
+- Añadida moderación temática de posts y archivos mediante `CHANNEL_THEMES`, con aviso privado al propietario.
+- Añadida extracción de la primera página PDF como portada JPEG con PyMuPDF.
+- Añadidos banners JPEG de respaldo con Pillow para DOCX o PDFs sin portada renderizable.
+- Añadida publicación multimedia con `sendPhoto` en el canal, incluyendo metadatos, estrellas y resumen generado por Gemini.
+- Añadido hash MD5 por documento y detección de duplicados por hash o título antes de guardar/publicar.
+- Añadido `/limpiar_duplicados`, restringido a `OWNER_ID`, que conserva el registro más antiguo y envía el informe de eliminados.
 
 ## Estado inicial
 
