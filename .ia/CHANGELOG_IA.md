@@ -1,30 +1,18 @@
 # Changelog de IA
 
-## 2026-09-08
+## 2026-09-08 - Persistencia y documentos multiformato
 
-### Estado inicial documentado
+- Añadida conexión PostgreSQL mediante `DATABASE_URL`.
+- Creadas las tablas `documents`, `conversations` y `channel_posts` al iniciar la aplicación.
+- Migrados a PostgreSQL los documentos, el historial de conversación y las publicaciones recientes de canales.
+- Añadida extracción de PDF, DOCX, CSV, XLSX y XLSM.
+- Añadidas `psycopg2-binary`, `python-docx` y `openpyxl` a `requirements.txt`.
+- Guardados metadatos de chat, mensaje y canal para documentos recibidos desde Telegram.
+- Validada la sintaxis de `app.py` y la extracción funcional de DOCX, XLSX y CSV.
+- Los datos que solo estaban en RAM antes de esta migración no pueden recuperarse automáticamente.
 
-- Registrada la arquitectura actual de `app.py` como bot de Telegram con Flask, Gemini, Open-Meteo y soporte de PDFs.
-- Documentadas las variables de entorno, comandos, endpoints, dependencias y comandos de despliegue.
-- Registradas las limitaciones actuales de persistencia, pruebas, validación de payloads y manejo de errores.
-- No se modificó la lógica de la aplicación.# Registro de Cambios e Interacciones con IA
+## Estado inicial
 
-## [Estado Inicial] - Base del Código
-- **Implementación Inicial:**
-  - Estructura base en `app.py` con Flask.
-  - Integración de Gemini mediante llamados HTTP directos con soporte para llamadas a funciones (`get_weather`).
-  - Lógica para procesamiento asíncrono de PDFs enviados por Telegram.
-  - Sistema básico de administración de canales y resumen con IA.
-
----
-
-### Plantilla para la Siguiente IA:
-*(Al completar un cambio, agrega una nueva entrada aquí con este formato)*
-
-## [AAAA-MM-DD] - Título breve del cambio
-- **Módulo modificado:** `app.py` / `requirements.txt` / etc.
-- **Cambios realizados:**
-  - Descripción de la modificación realizada.
-- **Tareas Pendientes / Siguientes pasos:**
-  - Qué debería implementar la siguiente
-  -  IA.
+- Bot Flask integrado con Telegram, Gemini y Open-Meteo.
+- Procesamiento inicial de PDFs mediante `pypdf`.
+- Administración de canales mediante comandos protegidos por `OWNER_ID`.

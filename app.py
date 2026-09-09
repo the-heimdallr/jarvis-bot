@@ -17,11 +17,16 @@ import io
 import re
 import time
 import gc
+import csv
+import json
 import unicodedata
 import threading
 import logging
+from contextlib import contextmanager
 import requests
 from pypdf import PdfReader
+from docx import Document as WordDocument
+from openpyxl import load_workbook
 from flask import Flask, request, jsonify
 
 logging.basicConfig(level=logging.INFO)
@@ -33,6 +38,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "changeme")
 OWNER_ID = os.environ.get("OWNER_ID")  # tu ID de Telegram (numérico), para que solo vos administres los canales
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 # CHANNELS: "nombre1:id1,nombre2:id2" -> ej "ciberdefensa:-1001234567890,cienciaspoliticas:-1009876543210"
 def _parse_channels():
@@ -46,12 +52,8 @@ def _parse_channels():
 
 CHANNELS = _parse_channels()
 
-# Guarda los últimos posts de cada canal en RAM (se pierde si el server reinicia)
-RECENT_POSTS = {name: [] for name in CHANNELS}
 MAX_POSTS_PER_CHANNEL = 30
 
-# Documentos (PDFs) que el bot fue aprendiendo. En RAM: se pierde si el server reinicia.
-DOCUMENTS = {}  # clave corta -> {"title": ..., "text": ...}
 MAX_DOC_CHARS = 300_000  # límite de texto por documento (memoria limitada en el plan Free de Render)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -59,6 +61,177 @@ GEMINI_API = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     f"gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
 )
+
+# --- Persistencia PostgreSQL ---
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS documents (
+    id BIGSERIAL PRIMARY KEY,
+    storage_key TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    file_type TEXT NOT NULL,
+    text_content TEXT NOT NULL,
+    source_chat_id BIGINT,
+    source_message_id BIGINT,
+    source_channel_name TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS documents_created_at_idx ON documents (created_at DESC);
+CREATE TABLE IF NOT EXISTS conversations (
+    chat_id BIGINT PRIMARY KEY,
+    messages JSONB NOT NULL DEFAULT '[]'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS channel_posts (
+    channel_name TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_id BIGINT NOT NULL,
+    text_content TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (channel_name, message_id)
+);
+CREATE INDEX IF NOT EXISTS channel_posts_recent_idx
+    ON channel_posts (channel_name, created_at DESC);
+"""
+
+
+@contextmanager
+def db_connection():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL no está configurada")
+    import psycopg2
+
+    connection = psycopg2.connect(DATABASE_URL)
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def init_database():
+    if not DATABASE_URL:
+        log.warning("DATABASE_URL no está configurada; la persistencia está deshabilitada")
+        return
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(SCHEMA_SQL)
+    log.info("Base de datos PostgreSQL inicializada")
+
+
+def save_document(key, title, file_type, text, source_chat_id=None,
+                  source_message_id=None, source_channel_name=None):
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO documents
+                    (storage_key, title, file_type, text_content, source_chat_id,
+                     source_message_id, source_channel_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (storage_key) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    file_type = EXCLUDED.file_type,
+                    text_content = EXCLUDED.text_content,
+                    source_chat_id = EXCLUDED.source_chat_id,
+                    source_message_id = EXCLUDED.source_message_id,
+                    source_channel_name = EXCLUDED.source_channel_name,
+                    created_at = NOW()
+                """,
+                (key, title, file_type, text, source_chat_id, source_message_id, source_channel_name),
+            )
+
+
+def get_document(key):
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT title, file_type, text_content FROM documents WHERE storage_key = %s",
+                (key,),
+            )
+            row = cursor.fetchone()
+    return {"title": row[0], "file_type": row[1], "text": row[2]} if row else None
+
+
+def list_documents():
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT storage_key, title, file_type FROM documents ORDER BY created_at DESC"
+            )
+            return cursor.fetchall()
+
+
+def load_conversation(chat_id):
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT messages FROM conversations WHERE chat_id = %s", (chat_id,))
+            row = cursor.fetchone()
+    return row[0] if row else []
+
+
+def save_conversation(chat_id, messages):
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO conversations (chat_id, messages, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (chat_id) DO UPDATE SET
+                    messages = EXCLUDED.messages, updated_at = NOW()
+                """,
+                (chat_id, json.dumps(messages)),
+            )
+
+
+def delete_conversation(chat_id):
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM conversations WHERE chat_id = %s", (chat_id,))
+
+
+def save_channel_post(channel_name, channel_id, message_id, text):
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO channel_posts (channel_name, channel_id, message_id, text_content)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (channel_name, message_id)
+                DO UPDATE SET text_content = EXCLUDED.text_content
+                """,
+                (channel_name, channel_id, message_id, text),
+            )
+            cursor.execute(
+                """
+                DELETE FROM channel_posts
+                WHERE channel_name = %s AND message_id NOT IN (
+                    SELECT message_id FROM channel_posts
+                    WHERE channel_name = %s ORDER BY created_at DESC LIMIT %s
+                )
+                """,
+                (channel_name, channel_name, MAX_POSTS_PER_CHANNEL),
+            )
+
+
+def get_recent_channel_posts(channel_name):
+    with db_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT message_id, text_content FROM channel_posts
+                WHERE channel_name = %s ORDER BY created_at DESC LIMIT %s
+                """,
+                (channel_name, MAX_POSTS_PER_CHANNEL),
+            )
+            rows = cursor.fetchall()
+    return [{"message_id": row[0], "text": row[1]} for row in reversed(rows)]
+
+
+init_database()
 
 # --- Manejo de documentos PDF (biblioteca de estudio) ---
 
@@ -90,37 +263,98 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
     return "\n".join(text_parts)[:MAX_DOC_CHARS]
 
 
-def process_document_async(document: dict, notify_chat_id):
-    resultado = handle_incoming_document(document)
+def extract_word_text(document_bytes: bytes) -> str:
+    document = WordDocument(io.BytesIO(document_bytes))
+    parts = [paragraph.text for paragraph in document.paragraphs]
+    for table in document.tables:
+        for row in table.rows:
+            parts.append(" | ".join(cell.text for cell in row.cells))
+    return "\n".join(part for part in parts if part.strip())[:MAX_DOC_CHARS]
+
+
+def extract_spreadsheet_text(file_bytes: bytes, file_name: str) -> str:
+    if file_name.lower().endswith(".csv"):
+        content = file_bytes.decode("utf-8-sig", errors="replace")
+        rows = csv.reader(io.StringIO(content))
+        return "\n".join(" | ".join(row) for row in rows)[:MAX_DOC_CHARS]
+
+    workbook = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+    parts = []
+    try:
+        for sheet in workbook.worksheets:
+            parts.append(f"[Hoja: {sheet.title}]")
+            for row in sheet.iter_rows(values_only=True):
+                values = ["" if value is None else str(value) for value in row]
+                if any(values):
+                    parts.append(" | ".join(values))
+                if sum(len(part) for part in parts) >= MAX_DOC_CHARS:
+                    break
+            if sum(len(part) for part in parts) >= MAX_DOC_CHARS:
+                break
+    finally:
+        workbook.close()
+    return "\n".join(parts)[:MAX_DOC_CHARS]
+
+
+def document_type(file_name: str):
+    extension = os.path.splitext(file_name.lower())[1]
+    return {
+        ".pdf": "pdf",
+        ".docx": "docx",
+        ".csv": "csv",
+        ".xlsx": "xlsx",
+        ".xlsm": "xlsx",
+    }.get(extension)
+
+
+def process_document_async(document: dict, notify_chat_id, source_message=None, source_channel_name=None):
+    resultado = handle_incoming_document(document, source_message, source_channel_name)
     send_telegram_message(notify_chat_id, resultado)
 
 
-def handle_incoming_document(document: dict) -> str:
-    file_name = document.get("file_name", "documento.pdf")
-    if not file_name.lower().endswith(".pdf"):
-        return f"'{file_name}' no es un PDF — por ahora solo puedo leer PDFs."
+def handle_incoming_document(document: dict, source_message=None, source_channel_name=None) -> str:
+    file_name = document.get("file_name", "documento")
+    file_type = document_type(file_name)
+    if not file_type:
+        return f"'{file_name}' no es un formato compatible (PDF, DOCX, XLSX, XLSM o CSV)."
 
     try:
-        pdf_bytes = download_telegram_file(document["file_id"])
-        text = extract_pdf_text(pdf_bytes)
+        file_bytes = download_telegram_file(document["file_id"])
+        extractors = {
+            "pdf": lambda: extract_pdf_text(file_bytes),
+            "docx": lambda: extract_word_text(file_bytes),
+            "csv": lambda: extract_spreadsheet_text(file_bytes, file_name),
+            "xlsx": lambda: extract_spreadsheet_text(file_bytes, file_name),
+        }
+        text = extractors[file_type]()
     except Exception:
-        log.exception("Error procesando PDF")
-        return "No pude procesar ese PDF."
+        log.exception("Error procesando documento %s", file_name)
+        return f"No pude procesar '{file_name}'."
 
     if not text.strip():
-        return f"Descargué '{file_name}' pero no pude extraerle texto (puede ser un PDF escaneado como imagen)."
+        return f"Descargué '{file_name}' pero no pude extraerle texto."
 
     key = slugify(file_name.rsplit(".", 1)[0])
-    DOCUMENTS[key] = {"title": file_name, "text": text}
+    source_chat_id = source_message.get("chat", {}).get("id") if source_message else None
+    source_message_id = source_message.get("message_id") if source_message else None
+    try:
+        save_document(key, file_name, file_type, text, source_chat_id, source_message_id, source_channel_name)
+    except Exception:
+        log.exception("Error guardando documento %s en PostgreSQL", file_name)
+        return f"Procesé '{file_name}', pero no pude guardarlo en PostgreSQL."
     return (
-        f"Aprendí '{file_name}' ({len(text):,} caracteres).\n"
+        f"Guardé '{file_name}' ({len(text):,} caracteres) en PostgreSQL.\n"
         f"Preguntame con: /libro {key} tu pregunta\n"
         f"Ver todos: /libros"
     )
 
 
 def ask_about_document(key: str, question: str) -> str:
-    doc = DOCUMENTS.get(key)
+    try:
+        doc = get_document(key)
+    except Exception:
+        log.exception("Error buscando documento %s", key)
+        return "No pude consultar la base de datos. Probá de nuevo."
     if not doc:
         return f"No tengo ningún documento guardado como '{key}'. Usá /libros para ver la lista."
 
@@ -140,10 +374,6 @@ def ask_about_document(key: str, question: str) -> str:
         return "Tuve un problema para responder sobre ese documento. Probá de nuevo."
 
 
-# Memoria simple en RAM: guarda los últimos mensajes por chat.
-# Se pierde si el servidor gratis de Render "duerme" y se reinicia.
-# Para memoria permanente habría que sumar una base de datos (se puede agregar después).
-CONVERSATIONS = {}
 MAX_HISTORY = 12  # cantidad de mensajes (usuario+bot) que recuerda por chat
 
 
@@ -230,7 +460,7 @@ def call_gemini(contents: list) -> dict:
 
 
 def ask_gemini(chat_id: int, user_text: str) -> str:
-    history = CONVERSATIONS.get(chat_id, [])
+    history = load_conversation(chat_id)
     history.append({"role": "user", "parts": [{"text": user_text}]})
     history = history[-MAX_HISTORY:]
 
@@ -270,11 +500,11 @@ def ask_gemini(chat_id: int, user_text: str) -> str:
         log.exception("Error llamando a Gemini")
         reply = "Tuve un problema para pensar la respuesta. Probá de nuevo en un momento."
         history.append({"role": "model", "parts": [{"text": reply}]})
-        CONVERSATIONS[chat_id] = history[-MAX_HISTORY:]
+        save_conversation(chat_id, history[-MAX_HISTORY:])
         return reply
 
     history.append({"role": "model", "parts": [{"text": reply}]})
-    CONVERSATIONS[chat_id] = history[-MAX_HISTORY:]
+    save_conversation(chat_id, history[-MAX_HISTORY:])
     return reply
 
 
@@ -287,7 +517,7 @@ def send_telegram_message(chat_id, text: str):
 
 
 def pin_last_message(channel_name: str) -> str:
-    posts = RECENT_POSTS.get(channel_name, [])
+    posts = get_recent_channel_posts(channel_name)
     if not posts:
         return f"No tengo mensajes registrados todavía de '{channel_name}'."
     last = posts[-1]
@@ -300,7 +530,7 @@ def pin_last_message(channel_name: str) -> str:
 
 
 def summarize_channel(channel_name: str) -> str:
-    posts = RECENT_POSTS.get(channel_name, [])
+    posts = get_recent_channel_posts(channel_name)
     if not posts:
         return f"Todavía no vi mensajes nuevos en '{channel_name}' desde que arrancó el bot."
     texto = "\n---\n".join(p["text"] for p in posts[-15:] if p.get("text"))
@@ -337,18 +567,16 @@ def handle_channel_post(post: dict):
         if OWNER_ID:
             threading.Thread(
                 target=lambda: send_telegram_message(
-                    OWNER_ID, f"[{name}] " + handle_incoming_document(post["document"])
+                    OWNER_ID, f"[{name}] " + handle_incoming_document(
+                        post["document"], post, name
+                    )
                 ),
                 daemon=True,
             ).start()
         return
 
     text = post.get("text") or post.get("caption") or ""
-    RECENT_POSTS.setdefault(name, []).append({
-        "message_id": post["message_id"],
-        "text": text,
-    })
-    RECENT_POSTS[name] = RECENT_POSTS[name][-MAX_POSTS_PER_CHANNEL:]
+    save_channel_post(name, chat_id_str, post["message_id"], text)
 
 
 def handle_owner_command(chat_id: int, text: str) -> bool:
@@ -390,10 +618,14 @@ def handle_owner_command(chat_id: int, text: str) -> bool:
         return True
 
     if cmd == "/libros":
-        if not DOCUMENTS:
+        documents = list_documents()
+        if not documents:
             send_telegram_message(chat_id, "Todavía no aprendí ningún PDF. Reenviame uno.")
         else:
-            lista = "\n".join(f"• {k} — {d['title']}" for k, d in DOCUMENTS.items())
+            lista = "\n".join(
+                f"• {key} ({file_type}) — {title}"
+                for key, title, file_type in documents
+            )
             send_telegram_message(chat_id, f"Documentos guardados:\n{lista}")
         return True
 
@@ -428,10 +660,10 @@ def webhook():
     text = message.get("text", "")
 
     if message.get("document") and OWNER_ID and sender_id == OWNER_ID:
-        send_telegram_message(chat_id, "Recibí el PDF, lo estoy procesando (puede tardar un minuto)...")
+        send_telegram_message(chat_id, "Recibí el documento, lo estoy procesando (puede tardar un minuto)...")
         threading.Thread(
             target=process_document_async,
-            args=(message["document"], chat_id),
+            args=(message["document"], chat_id, message, None),
             daemon=True,
         ).start()
         return jsonify(ok=True)
@@ -441,7 +673,10 @@ def webhook():
         return jsonify(ok=True)
 
     if text.strip().lower() in ("/start", "/reset"):
-        CONVERSATIONS.pop(chat_id, None)
+        try:
+            delete_conversation(chat_id)
+        except Exception:
+            log.exception("Error reiniciando conversación de %s", chat_id)
         send_telegram_message(chat_id, "¡Hola! Soy tu Jarvis. ¿En qué te ayudo?")
         return jsonify(ok=True)
 
