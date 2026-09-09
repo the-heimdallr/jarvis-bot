@@ -992,11 +992,29 @@ def ask_gemini(chat_id: int, user_text: str) -> str:
 
 
 def send_telegram_message(chat_id, text: str):
-    requests.post(
-        f"{TELEGRAM_API}/sendMessage",
-        json={"chat_id": chat_id, "text": text},
-        timeout=15,
-    )
+    try:
+        requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=15,
+        )
+    except requests.RequestException:
+        log.exception("Error enviando mensaje de Telegram a %s", chat_id)
+
+
+def notify_owner_error(context: str, exc: Exception):
+    """Avisa al OWNER_ID por Telegram cuando algo se rompe en segundo plano.
+
+    Nunca debe tirar una excepción propia: si falla el aviso, solo se loguea.
+    """
+    log.exception("Error en %s", context)
+    if not OWNER_ID:
+        return
+    try:
+        detail = str(exc)[:300]
+        send_telegram_message(int(OWNER_ID), f"⚠️ Error en {context}: {detail}")
+    except Exception:
+        log.exception("No se pudo notificar el error al owner")
 
 
 def send_telegram_photo(channel_id, cover: bytes, caption: str) -> bool:
@@ -1374,49 +1392,78 @@ def admin():
 
 @app.route(f"/webhook/{WEBHOOK_SECRET if WEBHOOK_SECRET else 'hook'}", methods=["POST"])
 def webhook():
-    update = request.get_json(force=True, silent=True) or {}
+    # Red de seguridad: pase lo que pase adentro, Telegram SIEMPRE recibe 200.
+    # Si devolvemos 500, Telegram reintenta el mismo update una y otra vez
+    # (mensajes duplicados, comandos ejecutados varias veces, etc.).
+    chat_id = None
+    try:
+        update = request.get_json(force=True, silent=True) or {}
 
-    if update.get("channel_post"):
-        handle_channel_post(update["channel_post"])
-        return jsonify(ok=True)
-
-    message = update.get("message") or update.get("edited_message")
-    if not message:
-        return jsonify(ok=True)
-
-    chat_id = message["chat"]["id"]
-    sender_id = str(message.get("from", {}).get("id", ""))
-    text = message.get("text", "")
-
-    if message.get("document") and OWNER_ID and sender_id == OWNER_ID:
-        send_telegram_message(chat_id, "Recibí el documento, lo estoy procesando (puede tardar un minuto)...")
-        threading.Thread(
-            target=process_document_async,
-            args=(message["document"], chat_id, message, None),
-            daemon=True,
-        ).start()
-        return jsonify(ok=True)
-
-    if not text:
-        send_telegram_message(chat_id, "Por ahora solo entiendo texto.")
-        return jsonify(ok=True)
-
-    if text.strip().lower() in ("/start", "/reset"):
-        try:
-            delete_conversation(chat_id)
-        except Exception:
-            log.exception("Error reiniciando conversación de %s", chat_id)
-        send_telegram_message(chat_id, "¡Hola! Soy tu Jarvis. ¿En qué te ayudo?")
-        return jsonify(ok=True)
-
-    # Comandos de administración de canales: solo el dueño puede usarlos
-    if text.startswith("/") and OWNER_ID and sender_id == OWNER_ID:
-        if handle_owner_command(chat_id, text):
+        if update.get("channel_post"):
+            handle_channel_post(update["channel_post"])
             return jsonify(ok=True)
 
-    reply = ask_gemini(chat_id, text)
-    send_telegram_message(chat_id, reply)
-    return jsonify(ok=True)
+        message = update.get("message") or update.get("edited_message")
+        if not message:
+            return jsonify(ok=True)
+
+        chat_id = message.get("chat", {}).get("id")
+        sender_id = str(message.get("from", {}).get("id", ""))
+        text = message.get("text", "")
+
+        if chat_id is None:
+            log.warning("Update sin chat_id, se ignora: %s", update)
+            return jsonify(ok=True)
+
+        if message.get("document") and OWNER_ID and sender_id == OWNER_ID:
+            send_telegram_message(chat_id, "Recibí el documento, lo estoy procesando (puede tardar un minuto)...")
+            threading.Thread(
+                target=process_document_async,
+                args=(message["document"], chat_id, message, None),
+                daemon=True,
+            ).start()
+            return jsonify(ok=True)
+
+        if not text:
+            send_telegram_message(chat_id, "Por ahora solo entiendo texto.")
+            return jsonify(ok=True)
+
+        if text.strip().lower() in ("/start", "/reset"):
+            try:
+                delete_conversation(chat_id)
+            except Exception:
+                log.exception("Error reiniciando conversación de %s", chat_id)
+            send_telegram_message(chat_id, "¡Hola! Soy tu Jarvis. ¿En qué te ayudo?")
+            return jsonify(ok=True)
+
+        # Comandos de administración de canales: solo el dueño puede usarlos
+        if text.startswith("/") and OWNER_ID and sender_id == OWNER_ID:
+            if handle_owner_command(chat_id, text):
+                return jsonify(ok=True)
+
+        reply = ask_gemini(chat_id, text)
+        send_telegram_message(chat_id, reply)
+        return jsonify(ok=True)
+
+    except Exception as exc:
+        notify_owner_error("webhook", exc)
+        if chat_id is not None:
+            send_telegram_message(chat_id, "Tuve un problema procesando tu mensaje. Ya le avisé al administrador.")
+        # Siempre 200: evita que Telegram reintente el mismo update en bucle.
+        return jsonify(ok=True)
+
+
+@app.errorhandler(Exception)
+def handle_uncaught_error(exc):
+    """Red de seguridad final: ninguna excepción debería tirar el proceso.
+
+    Cubre /admin, /, y cualquier ruta futura que Roo agregue sin su propio
+    try/except. El webhook ya se protege a sí mismo más arriba.
+    """
+    notify_owner_error(f"ruta {request.path}", exc)
+    if request.path.startswith("/webhook"):
+        return jsonify(ok=True)
+    return jsonify(error="internal_error"), 500
 
 
 if __name__ == "__main__":
