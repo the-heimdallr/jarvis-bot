@@ -43,6 +43,7 @@ app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "changeme")
 OWNER_ID = os.environ.get("OWNER_ID")  # tu ID de Telegram (numérico), para que solo vos administres los canales
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -80,7 +81,7 @@ MAX_DOC_CHARS = 300_000  # límite de texto por documento (memoria limitada en e
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 GEMINI_API = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
-    f"gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
+    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
 # --- Persistencia PostgreSQL ---
@@ -739,7 +740,14 @@ TOOLS = [{
 AVAILABLE_FUNCTIONS = {"get_weather": get_weather}
 
 
+class GeminiAPIError(RuntimeError):
+    """Error controlado para fallos de configuración, cuota o disponibilidad de Gemini."""
+
+
 def call_gemini(contents: list) -> dict:
+    if not GEMINI_API_KEY:
+        raise GeminiAPIError("Falta configurar GEMINI_API_KEY en las variables de entorno.")
+
     payload = {
         "contents": contents,
         "tools": TOOLS,
@@ -754,13 +762,37 @@ def call_gemini(contents: list) -> dict:
         },
     }
     for attempt in range(3):
-        r = requests.post(GEMINI_API, json=payload, timeout=30)
+        try:
+            r = requests.post(GEMINI_API, json=payload, timeout=30)
+        except requests.RequestException as exc:
+            if attempt == 2:
+                raise GeminiAPIError("No se pudo conectar con la API de Gemini.") from exc
+            time.sleep(2 * (attempt + 1))
+            continue
         if r.status_code in (503, 429) and attempt < 2:
             time.sleep(2 * (attempt + 1))
             continue
-        r.raise_for_status()
-        return r.json()
-    r.raise_for_status()
+        if not r.ok:
+            try:
+                error_message = r.json().get("error", {}).get("message", "")
+            except ValueError:
+                error_message = ""
+            if r.status_code == 429:
+                raise GeminiAPIError("Gemini agotó la cuota disponible. Probá más tarde.")
+            if r.status_code == 401 or r.status_code == 403:
+                raise GeminiAPIError("La GEMINI_API_KEY no es válida o no tiene permisos.")
+            if r.status_code == 404:
+                raise GeminiAPIError(
+                    f"El modelo Gemini '{GEMINI_MODEL}' no está disponible. "
+                    "Configurá GEMINI_MODEL con un modelo habilitado."
+                )
+            detail = f": {error_message}" if error_message else "."
+            raise GeminiAPIError(f"La API de Gemini devolvió HTTP {r.status_code}{detail}")
+        try:
+            return r.json()
+        except ValueError as exc:
+            raise GeminiAPIError("Gemini devolvió una respuesta inválida.") from exc
+    raise GeminiAPIError("Gemini no está disponible en este momento.")
 
 
 def ask_gemini(chat_id: int, user_text: str) -> str:
@@ -800,6 +832,12 @@ def ask_gemini(chat_id: int, user_text: str) -> str:
         if not reply:
             reply = "No pude generar una respuesta."
 
+    except GeminiAPIError as exc:
+        log.warning("Error de Gemini: %s", exc)
+        reply = f"No pude consultar Gemini: {exc}"
+        history.append({"role": "model", "parts": [{"text": reply}]})
+        save_conversation(chat_id, history[-MAX_HISTORY:])
+        return reply
     except Exception:
         log.exception("Error llamando a Gemini")
         reply = "Tuve un problema para pensar la respuesta. Probá de nuevo en un momento."
@@ -855,13 +893,17 @@ def publish_book_cover(file_type: str, file_bytes: bytes, metadata: dict,
 
 
 def send_telegram_document(chat_id, content: bytes, filename: str) -> bool:
-    response = requests.post(
-        f"{TELEGRAM_API}/sendDocument",
-        data={"chat_id": chat_id},
-        files={"document": (filename, content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-        timeout=30,
-    )
-    return response.ok and response.json().get("ok", False)
+    try:
+        response = requests.post(
+            f"{TELEGRAM_API}/sendDocument",
+            data={"chat_id": chat_id},
+            files={"document": (filename, content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            timeout=30,
+        )
+        return response.ok and response.json().get("ok", False)
+    except (requests.RequestException, ValueError):
+        log.exception("Error enviando %s por sendDocument", filename)
+        return False
 
 
 def export_documents_excel(chat_id: int) -> str:
