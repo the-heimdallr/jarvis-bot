@@ -1,0 +1,25 @@
+# Reglas de Diagnóstico de APIs para Roo Code
+
+Cuando analices un reporte de estado de API (o archivo JSON/logs de error), sigue estas instrucciones de diagnóstico específicas:
+
+1. **Si el error es `ENOTFOUND` o `EAI_AGAIN`:**
+   - Diagnostic text: "Problema de DNS o dominio no existente. Verifica si el nombre del host está bien escrito o si la red local/servidor DNS falló."
+
+   2. **Si el error es `ECONNREFUSED`:**
+      - Diagnostic text: "El puerto o servidor está apagado o un Firewall/Proxy está bloqueando la conexión entrante."
+
+      3. **Si el error es `ETIMEDOUT` o `ECONNABORTED`:**
+         - Diagnostic text: "Caída de conexión por Timeout. El servidor tardó más del tiempo límite configurado o hay alta latencia de red."
+
+         4. **Si el estado HTTP es 401 / 403:**
+            - Diagnostic text: "Fallo de autenticación o autorización. Revisa si el JWT/Token o API Key expiró, está mal escrito o falta en los headers."
+
+            5. **Si el estado HTTP es 502 / 503 / 504:**
+               - Diagnostic text: "Error del servidor upstream / Load Balancer. Nginx, Cloudflare o la pasarela no puede comunicarse con el servicio backend subyacente."
+
+               6. **Estructura de respuesta requerida:**
+                  - **Servicio Afectado:** Nombre del servicio y URL.
+                     - **Diagnóstico Preciso:** Explicación técnica clara (basada en el mapeo anterior).
+                        - **Causa Raíz Posible:** Qué pudo haberlo provocado.
+                           - **Acción Correctiva Sugerida:** Comandos de terminal o cambios de código específicos para solucionarlo.
+                           
